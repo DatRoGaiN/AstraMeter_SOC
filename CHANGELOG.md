@@ -1,6 +1,6 @@
 # Changelog
 
-## Next
+## 2.0.0
 
 ### Breaking
 - **Rebranded** project from "B2500 Meter" to "AstraMeter" (formerly b2500-meter). Package renamed to `astrameter`, CLI commands are now `astrameter` and `astra-sim`. Docker image moved from `ghcr.io/tomquist/b2500-meter` to `ghcr.io/tomquist/astrameter` (the legacy `ghcr.io/tomquist/b2500-meter` image is still published in parallel for backward compatibility). Home Assistant users must update their app repository URL to `https://github.com/tomquist/astrameter#main` ([#302](https://github.com/tomquist/astrameter/pull/302), [#304](https://github.com/tomquist/astrameter/pull/304)).
