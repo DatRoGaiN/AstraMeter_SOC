@@ -1,6 +1,6 @@
 # Changelog
 
-## Next
+## 2.1.1
 
 - **Changed** transient meter-read failures (in the Shelly emulator and the CT002/CT003 emulator, e.g. when an HTTP source times out) now log a single-line warning instead of a full stack trace; the traceback is included only when running at `LOG_LEVEL = DEBUG` ([#404](https://github.com/tomquist/astrameter/issues/404)).
 - **Added** the Hampel outlier filter and PID controller as optional fields in the Home Assistant add-on Configuration tab (alongside the existing smoothing/deadband options) — all optional and off unless you set them. The web config generator gained a "Home Assistant add-on" target that produces a ready-to-paste add-on options block including these filters.
