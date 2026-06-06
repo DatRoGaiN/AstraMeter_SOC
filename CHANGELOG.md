@@ -1,5 +1,8 @@
 # Changelog
 
+## Next
+
+
 ## 2.1.2
 
 - **Added** a **Min DC Output** option that keeps a DC battery's inverter (e.g. the Marstek B2500) from switching off at 0 W and falling asleep under high PV surplus. Set it globally (`MIN_DC_OUTPUT`) or per battery from Home Assistant; off by default ([#425](https://github.com/tomquist/astrameter/issues/425)).
