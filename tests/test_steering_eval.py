@@ -104,6 +104,8 @@ def test_scenario_registry_shape():
     assert "two_venus_solar/eff" in scenarios
     assert "mixed_cadence_solar/fair" in scenarios
     assert "mixed_cadence_solar/eff" in scenarios
+    # Washing-machine spike-absorption stress (issue #473).
+    assert "single_venus_washer" in scenarios
     assert scenarios["two_venus/eff"].ct_kwargs["min_efficient_power"] > 0
     for sc in scenarios.values():
         assert sc.duration_s > 0 and sc.batteries
@@ -127,6 +129,25 @@ def test_markdown_compare_renders():
     assert "steering-eval-report.html" not in md
     md_with_report = render_markdown_compare([base], [res], report_available=True)
     assert "steering-eval-report.html" in md_with_report
+
+
+def test_compare_tolerates_base_missing_a_new_metric():
+    """A base produced before a metric existed (this PR adds grid_p2p_w) must
+    not break the comparison — CI runs base (old code) vs head (new code), so
+    the base rows lack newly added keys. Both renderers must degrade to '—'."""
+    res = asyncio.run(run_scenario(_tiny_scenario(), seed=3))
+    assert "grid_p2p_w" in res
+    base_old = {k: v for k, v in res.items() if k != "grid_p2p_w"}
+    md = render_markdown_compare([base_old], [res])
+    assert "grid_p2p_w" in md  # row still rendered (Base shows —)
+    h = render_html_report(
+        [base_old],
+        [res],
+        report_metrics=_REPORT_METRICS,
+        metric_glossary=_METRIC_GLOSSARY,
+        fmt_delta=_fmt_delta,
+    )
+    assert "grid_p2p_w" in h
 
 
 def test_html_report_is_self_contained_and_interactive():
@@ -220,13 +241,47 @@ def test_metric_glossary_covers_every_reported_metric():
     assert glossary_keys == _REPORT_METRICS
 
 
-@pytest.mark.parametrize("name", ["single_venus_steps"])
+@pytest.mark.parametrize("name", ["single_venus_steps", "single_venus_washer"])
 def test_full_scenario_definitions_build(name):
     import random
 
     sc = build_scenarios()[name]
     events = sc.build_events(random.Random(1))
     assert events and all(e.at >= 0 for e in events)
+
+
+def test_washer_scenario_reproduces_sustained_oscillation():
+    """The washing-machine scenario (issue #473) reproduces the field signature:
+    a drum-tumble rhythm over a latency-delayed meter, so the loop hunts
+    continuously instead of holding zero. It is scored on the sustained-
+    oscillation aggregates (the step-response metrics read 0 for this failure
+    mode); a balancer fix should drive these down — that's the baseline's point.
+    We assert it *reproduces* hunting, not a specific (currently poor) score."""
+    sc = build_scenarios()["single_venus_washer"]
+    res = asyncio.run(run_scenario(sc, seed=1))
+    # The latency-driven hunt makes the grid oscillate and mistrack.
+    assert res["grid_p2p_w"] > 0
+    assert res["band_crossings_per_h"] > 0
+    assert res["mean_abs_grid_w"] > 0
+    # All reported metrics are populated and non-negative.
+    for key in _REPORT_METRICS:
+        assert res[key] >= 0, key
+
+
+def test_meter_latency_drives_sustained_oscillation():
+    """Acting on a delayed meter reading turns a settling loop into one that
+    hunts: the washing-machine scenario's grid swing (grid_p2p_w) is markedly
+    larger with its meter latency than with the delay removed. This guards the
+    latency model (issue #473) that reproduces the field oscillation."""
+    import dataclasses
+
+    sc = build_scenarios()["single_venus_washer"]
+    assert sc.meter_latency_s > 0  # the scenario opts into delay
+    delayed = asyncio.run(run_scenario(sc, seed=1))
+    instant = asyncio.run(
+        run_scenario(dataclasses.replace(sc, meter_latency_s=0.0), seed=1)
+    )
+    assert delayed["grid_p2p_w"] > instant["grid_p2p_w"]
 
 
 class TestRampPacingRegression:
