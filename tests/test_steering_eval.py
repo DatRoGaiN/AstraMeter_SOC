@@ -11,6 +11,7 @@ import asyncio
 
 import pytest
 
+from astrameter.simulator.eval_report import render_html_report
 from astrameter.simulator.evaluation import (
     _METRIC_GLOSSARY,
     _REPORT_METRICS,
@@ -18,6 +19,7 @@ from astrameter.simulator.evaluation import (
     BatterySpec,
     Event,
     Scenario,
+    _fmt_delta,
     build_scenarios,
     render_markdown_compare,
     run_scenario,
@@ -96,6 +98,12 @@ def test_scenario_registry_shape():
     assert "two_venus/eff" in scenarios
     assert "mixed_venus_b2500/fair" in scenarios
     assert "mixed_venus_b2500/eff" in scenarios
+    # Venus families also have solar variants (load + PV day curve + clouds),
+    # exercising the charge/export side of the loop, not just discharge.
+    assert "two_venus_solar/fair" in scenarios
+    assert "two_venus_solar/eff" in scenarios
+    assert "mixed_cadence_solar/fair" in scenarios
+    assert "mixed_cadence_solar/eff" in scenarios
     assert scenarios["two_venus/eff"].ct_kwargs["min_efficient_power"] > 0
     for sc in scenarios.values():
         assert sc.duration_s > 0 and sc.batteries
@@ -111,16 +119,100 @@ def test_markdown_compare_renders():
     assert "What do these metrics mean?" in md
     for key in _REPORT_METRICS:
         assert f"| `{key}` |" in md
-    # Each scenario embeds a Mermaid grid-power chart with a base and head line.
-    assert "```mermaid" in md
-    assert "xychart-beta" in md
-    assert md.count("    line [") == 2
+    # The interactive charts moved to the HTML artifact, never an embedded
+    # (static, unreadable) Mermaid chart.
+    assert "mermaid" not in md
+    # The report pointer only appears when a report is actually produced, so a
+    # plain --compare run doesn't promise a link that won't exist.
+    assert "steering-eval-report.html" not in md
+    md_with_report = render_markdown_compare([base], [res], report_available=True)
+    assert "steering-eval-report.html" in md_with_report
+
+
+def test_html_report_is_self_contained_and_interactive():
+    res = asyncio.run(run_scenario(_tiny_scenario(), seed=3))
+    base = dict(res, overshoot_max_w=res["overshoot_max_w"] + 100.0)
+    h = render_html_report(
+        [base],
+        [res],
+        report_metrics=_REPORT_METRICS,
+        metric_glossary=_METRIC_GLOSSARY,
+        fmt_delta=_fmt_delta,
+    )
+    # Self-contained: the uPlot library and CSS are inlined (no CDN/network).
+    assert "uPlot" in h and "https://cdn." not in h
+    assert ".uplot" in h  # vendored CSS
+    # Per scenario: a grid chart (base vs head) and a per-battery output chart.
+    assert 'id="grid0"' in h
+    assert 'id="batt0"' in h
+    assert "Battery output" in h
+    assert res["battery_labels"][0] in h  # battery series labelled
+    # Net house consumption is overlaid on the grid chart as a dashed line.
+    assert '"label": "consumption"' in h
+    assert '"dash"' in h
+    assert res["scenario"] in h
+    # Metrics table with colour-coded (lower-is-better) deltas.
+    assert "overshoot_max_w" in h
+    assert 'class="better"' in h or 'class="worse"' in h
+
+
+def test_html_report_escapes_script_breakout_in_chart_data():
+    res = asyncio.run(run_scenario(_tiny_scenario(), seed=3))
+    # A label that would close the inline <script> if embedded verbatim.
+    res = dict(res, battery_labels=["</script><b>x"])
+    h = render_html_report(
+        None,
+        [res],
+        report_metrics=_REPORT_METRICS,
+        metric_glossary=_METRIC_GLOSSARY,
+        fmt_delta=_fmt_delta,
+    )
+    # The raw breakout sequence must not survive into the chart JSON; '<' is
+    # escaped to the JSON-valid <.
+    assert "</script><b>x" not in h
+    assert "\\u003c/script>" in h
+
+
+def test_html_report_handles_missing_baseline():
+    res = asyncio.run(run_scenario(_tiny_scenario(), seed=3))
+    h = render_html_report(
+        None,
+        [res],
+        report_metrics=_REPORT_METRICS,
+        metric_glossary=_METRIC_GLOSSARY,
+        fmt_delta=_fmt_delta,
+    )
+    # Head-only still renders the grid (head series) and per-battery charts.
+    assert 'id="grid0"' in h
+    assert 'id="batt0"' in h
 
 
 def test_grid_trace_is_downsampled_to_fixed_length():
     res = asyncio.run(run_scenario(_tiny_scenario(), seed=3))
     assert len(res["grid_trace"]) == GRAPH_POINTS
     assert all(isinstance(v, float) for v in res["grid_trace"])
+
+
+def test_battery_traces_one_per_battery_fixed_length():
+    res = asyncio.run(run_scenario(_tiny_scenario(), seed=3))
+    # One label and one fixed-length downsampled trace per battery.
+    assert res["battery_labels"] == ["B1 HMG-50"]
+    assert len(res["battery_traces"]) == 1
+    assert len(res["battery_traces"][0]) == GRAPH_POINTS
+    assert all(isinstance(v, float) for v in res["battery_traces"][0])
+
+
+def test_consumption_trace_matches_grid_plus_battery_output():
+    res = asyncio.run(run_scenario(_tiny_scenario(), seed=3))
+    cons = res["consumption_trace"]
+    assert len(cons) == GRAPH_POINTS
+    # Energy-balance identity (within downsample rounding): consumption ==
+    # grid + sum of battery outputs at each bucket.
+    grid = res["grid_trace"]
+    bat = res["battery_traces"]
+    for k in range(GRAPH_POINTS):
+        expected = grid[k] + sum(b[k] for b in bat)
+        assert abs(cons[k] - expected) <= 1.0
 
 
 def test_metric_glossary_covers_every_reported_metric():

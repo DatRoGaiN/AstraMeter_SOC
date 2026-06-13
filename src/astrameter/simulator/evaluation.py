@@ -70,15 +70,9 @@ HEADROOM_MARGIN_W = 5.0
 SOC_EMPTY = 0.02
 SOC_FULL = 0.98
 # Number of points each scenario's grid-power trace is downsampled to for the
-# Mermaid chart in the CI PR comment. Base and head share this fixed count so
-# the two lines align by index regardless of poll cadence.
+# interactive charts in the HTML report. Base and head share this fixed count
+# so the two lines align by index regardless of poll cadence.
 GRAPH_POINTS = 1800
-# Mermaid's plot line has a fixed pixel stroke width with no config knob, so we
-# enlarge the chart canvas instead: GitHub scales the SVG down to the comment
-# width, which renders the line proportionally thinner — and the extra width
-# gives the 1800 points room to resolve instead of blobbing together.
-GRAPH_WIDTH = 1800
-GRAPH_HEIGHT = 600
 
 
 # ---------------------------------------------------------------------------
@@ -352,20 +346,24 @@ def _settle_time(samples: list[_Sample], start: float, end: float) -> float | No
     return None
 
 
-def _downsample_grid(
-    samples: list[_Sample], duration_s: float, n: int = GRAPH_POINTS
+def _downsample_series(
+    samples: list[_Sample],
+    duration_s: float,
+    pick: Callable[[_Sample], float],
+    n: int = GRAPH_POINTS,
 ) -> list[float]:
-    """Bucket the grid trace into *n* evenly spaced mean values over the run.
+    """Bucket a per-sample value into *n* evenly spaced means over the run.
 
+    *pick* selects the value from each sample (grid, a battery's power, ...).
     Empty buckets carry the previous value forward so the chart has no gaps;
-    the fixed length lets base and head overlay by index in the PR comment.
+    the fixed length lets traces from different runs overlay by index.
     """
     if not samples or duration_s <= 0 or n <= 0:
         return []
     buckets: list[list[float]] = [[] for _ in range(n)]
     for s in samples:
         idx = min(int(s.t / duration_s * n), n - 1)
-        buckets[idx].append(s.grid)
+        buckets[idx].append(pick(s))
     out: list[float] = []
     last = 0.0
     for bucket in buckets:
@@ -373,6 +371,12 @@ def _downsample_grid(
             last = sum(bucket) / len(bucket)
         out.append(round(last, 1))
     return out
+
+
+def _battery_pick(i: int) -> Callable[[_Sample], float]:
+    """Return a picker for battery *i*'s output (a typed closure, so the
+    per-battery downsampling avoids an inline lambda mypy can't infer)."""
+    return lambda s: s.powers[i]
 
 
 def _compute_metrics(
@@ -486,7 +490,25 @@ def _compute_metrics(
         "avoidable_import_wh": round(avoid_import_wh, 1),
         "avoidable_export_wh": round(avoid_export_wh, 1),
         "battery_travel_w_per_h": round(travel_w / duration_h, 0),
-        "grid_trace": _downsample_grid(samples, scenario.duration_s),
+        "grid_trace": _downsample_series(
+            samples, scenario.duration_s, lambda s: s.grid
+        ),
+        # Net house consumption at the meter coupling = grid + Σ(battery AC
+        # output) by energy balance.  It's the same scripted load in base and
+        # head, so one trace is enough; the HTML grid chart overlays it as
+        # context (grid = consumption minus battery output).
+        "consumption_trace": _downsample_series(
+            samples, scenario.duration_s, lambda s: s.grid + sum(s.powers)
+        ),
+        # Per-battery output traces (one downsampled series each) and labels,
+        # for the per-scenario battery-output chart in the HTML report.
+        "battery_labels": [
+            f"B{i + 1} {specs[i].device_type}" for i in range(len(specs))
+        ],
+        "battery_traces": [
+            _downsample_series(samples, scenario.duration_s, _battery_pick(i))
+            for i in range(len(specs))
+        ],
     }
 
 
@@ -624,6 +646,24 @@ def _dc_solar_curve(duration: float, peak: float, battery_index: int) -> list[Ev
     return events
 
 
+def _household_and_solar(
+    rng: random.Random, duration: float, solar_peak: float
+) -> list[Event]:
+    """Household appliance steps over an AC solar day curve with cloud dips.
+
+    Combines the discharge-side step schedule with a half-sine PV curve big
+    enough to push the pool into export/charge territory around midday, so the
+    scenario exercises the full bidirectional loop (charge distribution, the
+    AC-charge clamp, zero-crossings) on top of the step responses — not just
+    discharge.
+    """
+    return (
+        _household_steps(rng, duration)
+        + _solar_curve(duration, solar_peak)
+        + _cloud_dips(rng, duration)
+    )
+
+
 def build_scenarios() -> dict[str, Scenario]:
     """All evaluation scenarios, keyed by name.
 
@@ -676,6 +716,26 @@ def build_scenarios() -> dict[str, Scenario]:
             )
         )
 
+    # Solar peak (W) for the multi-Venus solar scenarios: above the base load
+    # plus typical appliance draw, so midday PV pushes the pool into charging /
+    # export for stretches.
+    solar_peak_house = 3000.0
+    for mode, kwargs in (("fair", {}), ("eff", _EFF_MODE)):
+        add(
+            Scenario(
+                name=f"two_venus_solar/{mode}",
+                description="Two Venus, household load + solar day curve + clouds",
+                batteries=[_VENUS, _VENUS],
+                duration_s=dur_solar,
+                base_load=[400.0, 0.0, 0.0],
+                loads=list(_HOUSEHOLD_LOADS),
+                build_events=lambda rng: _household_and_solar(
+                    rng, dur_solar, solar_peak_house
+                ),
+                ct_kwargs=dict(kwargs),
+            )
+        )
+
     dur_mixed = 5400.0
     for mode, kwargs in (("fair", {}), ("eff", _EFF_MODE)):
         add(
@@ -702,6 +762,22 @@ def build_scenarios() -> dict[str, Scenario]:
                 duration_s=dur_steps,
                 loads=list(_HOUSEHOLD_LOADS),
                 build_events=lambda rng: _household_steps(rng, dur_steps),
+                ct_kwargs=dict(kwargs),
+            )
+        )
+
+    for mode, kwargs in (("fair", {}), ("eff", _EFF_MODE)):
+        add(
+            Scenario(
+                name=f"mixed_cadence_solar/{mode}",
+                description="Slow V2 + fast V3, household load + solar + clouds",
+                batteries=[_VENUS_V2_SLOW, _VENUS_V3],
+                duration_s=dur_solar,
+                base_load=[400.0, 0.0, 0.0],
+                loads=list(_HOUSEHOLD_LOADS),
+                build_events=lambda rng: _household_and_solar(
+                    rng, dur_solar, solar_peak_house
+                ),
                 ct_kwargs=dict(kwargs),
             )
         )
@@ -810,8 +886,22 @@ def _fmt_delta(base: float, head: float) -> str:
     return f"{(head - base) / abs(base) * 100.0:+.0f}%"
 
 
-def render_markdown_compare(base: list[dict], head: list[dict]) -> str:
-    """Markdown before/after table for the CI PR comment."""
+def render_markdown_compare(
+    base: list[dict], head: list[dict], *, report_available: bool = False
+) -> str:
+    """Markdown before/after tables for the CI PR comment.
+
+    The comment carries the metrics tables for an at-a-glance read; the
+    interactive grid-power charts live in the self-contained HTML report
+    (:func:`astrameter.simulator.eval_report.render_html_report`) that CI
+    uploads as the ``steering-eval`` artifact, since GitHub can't render an
+    interactive chart inline in a comment.
+
+    Set *report_available* when an HTML report is being produced (and CI will
+    append a link to it); only then is the "see the link below" pointer
+    included, so a plain ``--compare`` run doesn't promise a report that
+    doesn't exist.
+    """
     base_by = {r["scenario"]: r for r in base}
     out = [
         "### Steering evaluation (base vs head)",
@@ -819,6 +909,15 @@ def render_markdown_compare(base: list[dict], head: list[dict]) -> str:
         "Lower is better for every metric. See "
         "`src/astrameter/simulator/evaluation.py` for definitions.",
         "",
+    ]
+    if report_available:
+        out += [
+            "📊 **Interactive grid-power charts** (zoom / hover / toggle series) "
+            "are in the self-contained `steering-eval-report.html` report — see "
+            "the link below (it opens directly in the browser).",
+            "",
+        ]
+    out += [
         "<details><summary><b>What do these metrics mean?</b></summary>",
         "",
         "| Metric | Meaning |",
@@ -842,7 +941,6 @@ def render_markdown_compare(base: list[dict], head: list[dict]) -> str:
             delta = _fmt_delta(float(b[key]), float(res[key])) if b else "—"
             out.append(f"| {key} | {bv} | {res[key]} | {delta} |")
         out.append("")
-        out.extend(_grid_chart(b, res))
         out.append("</details>")
     missing = [
         r["scenario"]
@@ -853,41 +951,6 @@ def render_markdown_compare(base: list[dict], head: list[dict]) -> str:
         out.append("")
         out.append(f"_Scenarios only in base: {', '.join(missing)}_")
     return "\n".join(out)
-
-
-def _grid_chart(base: dict | None, head: dict) -> list[str]:
-    """Mermaid ``xychart`` of grid power over time, base vs head overlaid.
-
-    Renders nothing when the head result predates the trace (older JSON
-    artifacts), so the comment stays valid across mixed-version runs.
-    """
-    head_trace = head.get("grid_trace") or []
-    if not head_trace:
-        return []
-    base_trace = (base or {}).get("grid_trace") or []
-    duration_min = round(float(head.get("duration_h", 0.0)) * 60)
-    caption = (
-        "Grid power over time (W) — line 1 = base, line 2 = head:"
-        if base_trace
-        else "Grid power over time (W) — head:"
-    )
-    lines = [
-        caption,
-        "",
-        "```mermaid",
-        f'%%{{init: {{"xyChart": {{"width": {GRAPH_WIDTH}, '
-        f'"height": {GRAPH_HEIGHT}}}}}}}%%',
-        "xychart-beta",
-        '    title "grid power (W)"',
-        f'    x-axis "minutes" 0 --> {duration_min}',
-        '    y-axis "W"',
-    ]
-    if base_trace:
-        lines.append(f"    line [{', '.join(f'{v:g}' for v in base_trace)}]")
-    lines.append(f"    line [{', '.join(f'{v:g}' for v in head_trace)}]")
-    lines.append("```")
-    lines.append("")
-    return lines
 
 
 def _summary_line(base: dict | None, head: dict) -> str:
@@ -969,6 +1032,12 @@ def main(argv: list[str] | None = None) -> None:
         metavar="BASELINE_JSON",
         help="compare results against a baseline JSON",
     )
+    parser.add_argument(
+        "--html",
+        metavar="PATH",
+        help="write the self-contained interactive HTML report to PATH "
+        "(uses --compare's baseline when given, else head-only)",
+    )
     parser.add_argument("--list", action="store_true", help="list scenarios and exit")
     args = parser.parse_args(argv)
 
@@ -988,12 +1057,26 @@ def main(argv: list[str] | None = None) -> None:
         with open(args.json, "w") as fh:
             json.dump(results, fh, indent=2)
 
+    base = None
     if args.compare:
         with open(args.compare) as fh:
             base = json.load(fh)
-        print(render_markdown_compare(base, results))
+        print(render_markdown_compare(base, results, report_available=bool(args.html)))
     elif not args.input:
         print(render_text(results))
+
+    if args.html:
+        from .eval_report import render_html_report
+
+        report = render_html_report(
+            base,
+            results,
+            report_metrics=_REPORT_METRICS,
+            metric_glossary=_METRIC_GLOSSARY,
+            fmt_delta=_fmt_delta,
+        )
+        with open(args.html, "w", encoding="utf-8") as fh:
+            fh.write(report)
 
 
 if __name__ == "__main__":
