@@ -110,11 +110,21 @@ def render_html_report(
     report_metrics: Sequence[str],
     metric_glossary: Sequence[tuple[str, str]],
     fmt_delta: Callable[[float, float], str],
+    aggregate: tuple[dict | None, dict] | None = None,
+    aggregate_summary: str = "",
+    note: str = "",
 ) -> str:
     """Return a self-contained HTML report comparing *base* and *head*.
 
     *base* may be ``None`` / empty (no baseline on the PR base branch), in which
     case each scenario renders head-only.
+
+    *aggregate*, when given, is a ``(base_agg, head_agg)`` pair of synthetic
+    roll-up rows (means across scenarios). It renders as a leading "Aggregate"
+    section so the overall direction of a change is visible before any
+    per-scenario table; *aggregate_summary* is a one-line verdict shown with it.
+    *note* is an optional caption (e.g. how many seeds were averaged) shown
+    under the page heading.
     """
     base_by = {r["scenario"]: r for r in (base or [])}
 
@@ -124,6 +134,14 @@ def render_html_report(
     )
 
     sections: list[str] = []
+    if aggregate is not None:
+        agg_base, agg_head = aggregate
+        n = agg_head.get("n_scenarios", len(head))
+        agg_parts = [f"<h2>Aggregate &mdash; mean across {_esc(n)} scenarios</h2>"]
+        if aggregate_summary:
+            agg_parts.append(f'<p class="summary">{_esc(aggregate_summary)}</p>')
+        agg_parts.append(_metrics_table(agg_base, agg_head, report_metrics, fmt_delta))
+        sections.append(f"<section>{''.join(agg_parts)}</section>")
     # Each chart is a generic {durationMin, series:[{label,color,data}, ...]}
     # so the same JS builder draws both the grid (base vs head) and the
     # per-battery output overlays.
@@ -193,6 +211,7 @@ def render_html_report(
         if base_by
         else f'<span class="key" style="color:{COLOR_HEAD}">&#9632; head</span>'
     )
+    note_html = f"<p class='summary'>{_esc(note)}</p>" if note else ""
     body = (
         "<div class='wrap'>"
         "<h1>Steering evaluation &mdash; base vs head</h1>"
@@ -200,6 +219,7 @@ def render_html_report(
         "(base vs head) and the head run's per-battery output. Drag on a chart "
         "to zoom, double-click to reset, click a series in the legend to toggle "
         "it. Lower is better for every metric.</p>"
+        f"{note_html}"
         "<details><summary><b>What do these metrics mean?</b></summary>"
         f"<table><thead><tr><th>Metric</th><th>Meaning</th></tr></thead>"
         f"<tbody>{glossary_rows}</tbody></table></details>"

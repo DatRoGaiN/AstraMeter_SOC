@@ -19,9 +19,16 @@ from astrameter.simulator.evaluation import (
     BatterySpec,
     Event,
     Scenario,
+    _aggregate,
+    _compare_aggregates,
     _fmt_delta,
+    _merge_seeds,
+    _overall_summary,
+    _run_all,
+    _seed_label,
     build_scenarios,
     render_markdown_compare,
+    render_text,
     run_scenario,
 )
 
@@ -242,6 +249,166 @@ def test_consumption_trace_matches_grid_plus_battery_output():
     for k in range(GRAPH_POINTS):
         expected = grid[k] + sum(b[k] for b in bat)
         assert abs(cons[k] - expected) <= 1.0
+
+
+def _two_results() -> list[dict]:
+    a = asyncio.run(run_scenario(_tiny_scenario(), seed=3))
+    b = dict(a, scenario="tiny2", settle_mean_s=a["settle_mean_s"] + 4.0)
+    return [a, b]
+
+
+def test_aggregate_is_per_metric_mean_across_scenarios():
+    results = _two_results()
+    agg = _aggregate(results)
+    assert agg["scenario"] == "AGGREGATE"
+    assert agg["n_scenarios"] == 2
+    # Every reported metric is the unweighted mean of the two scenarios.
+    for key in _REPORT_METRICS:
+        expected = (float(results[0][key]) + float(results[1][key])) / 2
+        assert agg[key] == round(expected, 1), key
+
+
+def test_aggregate_omits_metrics_absent_from_every_result():
+    res = asyncio.run(run_scenario(_tiny_scenario(), seed=3))
+    old = {k: v for k, v in res.items() if k != "grid_p2p_w"}
+    # A base produced before grid_p2p_w existed contributes no value for it, so
+    # the aggregate simply omits the key (renderers then show '—').
+    assert "grid_p2p_w" not in _aggregate([old])
+    assert "grid_p2p_w" in _aggregate([res])
+
+
+def test_overall_summary_reports_direction():
+    base_agg = {"settle_mean_s": 10.0, "overshoot_max_w": 100.0}
+    better = {"settle_mean_s": 8.0, "overshoot_max_w": 90.0}
+    worse = {"settle_mean_s": 12.0, "overshoot_max_w": 110.0}
+    assert "(better)" in _overall_summary(base_agg, better)
+    assert "improved" in _overall_summary(base_agg, better)
+    assert "(worse)" in _overall_summary(base_agg, worse)
+
+
+def test_overall_summary_denominator_counts_only_compared_metrics():
+    # Base carries only 2 of the reported metrics (e.g. an older base from
+    # before others existed); the verdict's denominator must be the metrics
+    # actually compared, not the full list.
+    base = {"settle_mean_s": 10.0, "overshoot_max_w": 100.0}
+    head = {"settle_mean_s": 8.0, "overshoot_max_w": 90.0}
+    assert "across 2 metrics" in _overall_summary(base, head)
+
+
+def test_compare_aggregates_uses_only_shared_scenarios():
+    def mk(name: str, settle: float) -> dict:
+        return {"scenario": name, "seed": 1, "settle_mean_s": settle}
+
+    # 'z' is base-only, 'c' is head-only; both must be excluded so the two
+    # aggregates are computed over the same {a, b} population.
+    base = [mk("a", 10.0), mk("b", 20.0), mk("z", 999.0)]
+    head = [mk("a", 8.0), mk("b", 16.0), mk("c", 1.0)]
+    base_agg, head_agg = _compare_aggregates(base, head)
+    assert base_agg is not None
+    assert base_agg["n_scenarios"] == head_agg["n_scenarios"] == 2
+    assert base_agg["settle_mean_s"] == 15.0  # (10+20)/2, no 'z'
+    assert head_agg["settle_mean_s"] == 12.0  # (8+16)/2, no 'c'
+    # No baseline: head aggregates over all its scenarios, base side is None.
+    assert _compare_aggregates(None, head) == (None, _aggregate(head))
+
+
+def test_render_text_adds_aggregate_only_for_multiple_scenarios():
+    multi = render_text(_two_results())
+    assert "AGGREGATE (mean across 2 scenarios)" in multi
+    # A single scenario would just echo its own numbers, so no aggregate.
+    single = render_text([asyncio.run(run_scenario(_tiny_scenario(), seed=3))])
+    assert "AGGREGATE" not in single
+
+
+def test_markdown_compare_leads_with_aggregate_rollup():
+    results = _two_results()
+    base = [dict(r, overshoot_max_w=r["overshoot_max_w"] + 50.0) for r in results]
+    md = render_markdown_compare(base, results)
+    assert "**Overall:" in md
+    assert "Aggregate — mean across 2 scenarios" in md
+    # The overall verdict and the aggregate table both precede any per-scenario
+    # collapsible, so the roll-up is the first thing a reviewer sees.
+    assert md.index("Aggregate — mean across") < md.index("<details>")
+
+
+def test_html_report_renders_aggregate_section():
+    results = _two_results()
+    base = [dict(r, overshoot_max_w=r["overshoot_max_w"] + 50.0) for r in results]
+    base_agg, head_agg = _aggregate(base), _aggregate(results)
+    h = render_html_report(
+        base,
+        results,
+        report_metrics=_REPORT_METRICS,
+        metric_glossary=_METRIC_GLOSSARY,
+        fmt_delta=_fmt_delta,
+        aggregate=(base_agg, head_agg),
+        aggregate_summary=_overall_summary(base_agg, head_agg),
+    )
+    assert "Aggregate &mdash; mean across 2 scenarios" in h
+    assert "improved" in h  # the one-line verdict is rendered
+
+
+def test_merge_seeds_averages_metrics_and_traces():
+    r1 = {
+        "scenario": "x",
+        "seed": 1,
+        "settle_mean_s": 10.0,
+        "unsettled_events": 0,
+        "grid_trace": [0.0, 10.0],
+        "battery_traces": [[1.0, 3.0]],
+        "battery_labels": ["B1 HMG-50"],
+    }
+    r2 = dict(
+        r1,
+        seed=2,
+        settle_mean_s=20.0,
+        unsettled_events=1,
+        grid_trace=[2.0, 20.0],
+        battery_traces=[[3.0, 5.0]],
+    )
+    merged = _merge_seeds([r1, r2])
+    assert merged["seeds"] == [1, 2] and merged["n_seeds"] == 2
+    assert "seed" not in merged  # the single-seed field is replaced
+    # Scalars and traces are the element-wise mean over seeds.
+    assert merged["settle_mean_s"] == 15.0
+    assert merged["unsettled_events"] == 0.5
+    assert merged["grid_trace"] == [1.0, 15.0]
+    assert merged["battery_traces"] == [[2.0, 4.0]]
+    # Labels (identical across seeds) pass through.
+    assert merged["battery_labels"] == ["B1 HMG-50"]
+
+
+def test_merge_seeds_single_seed_is_passthrough():
+    r = {"scenario": "x", "seed": 1, "settle_mean_s": 10.0}
+    # One seed: nothing to average, the original row (with its seed) is returned.
+    assert _merge_seeds([r]) is r
+
+
+def test_seed_label_reads_single_or_averaged():
+    assert _seed_label({"seed": 3}) == "seed 3"
+    assert _seed_label({"n_seeds": 4, "seeds": [1, 2, 3, 4]}) == "mean of 4 seeds"
+
+
+def test_markdown_compare_notes_seed_averaging():
+    res = asyncio.run(run_scenario(_tiny_scenario(), seed=3))
+    head = [dict(res, n_seeds=3, seeds=[1, 2, 3])]
+    md = render_markdown_compare([res], head)
+    # The reader is told the head figures are seed-averaged (not a single draw).
+    assert "Metrics are the per-scenario" in md
+    assert "mean of 3 seeds" in md
+
+
+def test_run_all_runs_seeds_in_parallel_and_merges():
+    # End-to-end through the process pool: one real (short) scenario over two
+    # seeds collapses to a single seed-averaged row.
+    results = _run_all(["single_venus_washer"], [1, 2], {})
+    assert len(results) == 1
+    r = results[0]
+    assert r["scenario"] == "single_venus_washer"
+    assert r["n_seeds"] == 2 and r["seeds"] == [1, 2]
+    assert "seed" not in r
+    for key in _REPORT_METRICS:
+        assert key in r
 
 
 def test_metric_glossary_covers_every_reported_metric():
