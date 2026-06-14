@@ -60,6 +60,9 @@ def _tiny_scenario() -> Scenario:
         duration_s=duration,
         base_load=[200.0, 0.0, 0.0],
         base_noise=0.0,
+        # Isolate the harness smoke test from the suite's realistic-meter
+        # default: a clean meter keeps these assertions deterministic.
+        meter_latency_s=0.0,
         build_events=events,
     )
 
@@ -120,6 +123,47 @@ def test_scenario_registry_shape():
     assert "single_venus_noisy" in scenarios
     assert "two_venus_noisy/fair" in scenarios
     assert "two_venus_noisy/eff" in scenarios
+    # Real recorded-household-load stress (correlated drift + spikes over a
+    # latency-delayed meter), single and two Venus (fair + eff).
+    assert "single_venus_trace" in scenarios
+    assert "two_venus_trace/fair" in scenarios
+    assert "two_venus_trace/eff" in scenarios
+    # The trace /eff variant raises min_efficient_power above the default eff
+    # floor so the concentration swap actually triggers within the real load's
+    # range (at the default floor it would duplicate /fair).
+    assert (
+        scenarios["two_venus_trace/eff"].ct_kwargs["min_efficient_power"]
+        > scenarios["two_venus/eff"].ct_kwargs["min_efficient_power"]
+    )
+    # The real-trace scenarios opt into realistic meter latency (the field
+    # condition the synthetic latency-free scenarios never cover).
+    assert scenarios["single_venus_trace"].meter_latency_s > 0
+    assert scenarios["two_venus_trace/fair"].meter_latency_s > 0
+    # Everyday scenarios now default to a realistic (non-zero) meter delay — no
+    # real meter is delay-free, so overshoot/settle is measured under latency.
+    assert scenarios["single_venus_steps"].meter_latency_s > 0
+    assert scenarios["two_venus/fair"].meter_latency_s > 0
+    # Slow-meter variants: a fresh reading only every 10 s (coarse-sampling
+    # stress), covering meters that emit a point ~once per 10 s.
+    for slow in (
+        "single_venus_steps_slow",
+        "single_venus_solar_slow",
+        "two_venus_slow/fair",
+    ):
+        assert slow in scenarios
+        assert scenarios[slow].meter_interval_s == 10.0
+        assert scenarios[slow].meter_latency_s > 0
+    # SoC-saturation scenarios: a small pack started near an edge and driven
+    # hard enough to actually hit empty / full (the handoff to grid).
+    assert "single_venus_drain" in scenarios
+    assert "single_venus_fill" in scenarios
+    # Three-phase imbalance: one Venus on each of A/B/C (everything else is
+    # single-phase A) — exercises per-phase target distribution.
+    assert "phase_imbalance" in scenarios
+    assert [b.phase for b in scenarios["phase_imbalance"].batteries] == ["A", "B", "C"]
+    # Real PV net-load (recorded PV + load with cloud transients), cf. the
+    # synthetic half-sine single_venus_solar.
+    assert "single_venus_pv" in scenarios
     # The noisy variant carries a markedly louder baseline than the stepped one.
     assert (
         scenarios["single_venus_noisy"].base_noise
@@ -488,6 +532,16 @@ def test_metric_glossary_covers_every_reported_metric():
         "single_venus_d_washer",
         "single_venus_d_solar",
         "venus_d_plus_c/fair",
+        "single_venus_trace",
+        "two_venus_trace/fair",
+        "two_venus_trace/eff",
+        "single_venus_steps_slow",
+        "single_venus_solar_slow",
+        "two_venus_slow/fair",
+        "single_venus_drain",
+        "single_venus_fill",
+        "phase_imbalance",
+        "single_venus_pv",
     ],
 )
 def test_full_scenario_definitions_build(name):
@@ -530,6 +584,120 @@ def test_noisy_scenario_has_no_labeled_events_but_scores_aggregates():
     assert res["mean_abs_grid_w"] > 0
     for key in _REPORT_METRICS:
         assert res[key] >= 0, key
+
+
+def test_trace_scenario_replays_real_load_and_scores_aggregates():
+    """The real-trace scenario drives the base load from a recorded household
+    trace (no scripted load steps, so the step-response metrics read 0) and is
+    scored on the sustained-oscillation/energy aggregates, all populated and
+    non-negative. Different seeds slice a different window of the recording, so
+    the load actually differs between seeds (genuine structural diversity, not
+    just re-randomised noise)."""
+    sc = build_scenarios()["single_venus_trace"]
+    res = asyncio.run(run_scenario(sc, seed=1))
+    assert res["events_measured"] == 0
+    assert res["grid_p2p_w"] > 0
+    assert res["mean_abs_grid_w"] > 0
+    for key in _REPORT_METRICS:
+        assert res[key] >= 0, key
+    # Two seeds slice different offsets into the recording, so the consumption
+    # trace (the scripted load itself) differs between them.
+    res2 = asyncio.run(run_scenario(sc, seed=2))
+    assert res["consumption_trace"] != res2["consumption_trace"]
+
+
+def test_trace_eff_variant_concentrates_unlike_fair():
+    """The two-Venus trace /eff variant raises min_efficient_power so efficiency
+    optimization actually engages on a real load: during a calm stretch it
+    concentrates onto one Venus and idles the second (which only cuts in on
+    peaks), so its per-battery split is markedly *unequal* where /fair always
+    splits evenly. Whether concentration happens depends on the window's load
+    level, so seed 2 is used — a calm-window slice where it clearly engages
+    (busy-window seeds keep both active, which is the correct load-dependent
+    behaviour). Guards against /eff silently degenerating into a copy of /fair."""
+    sc = build_scenarios()
+    fair = asyncio.run(run_scenario(sc["two_venus_trace/fair"], seed=2))
+    eff = asyncio.run(run_scenario(sc["two_venus_trace/eff"], seed=2))
+
+    def imbalance(res):
+        b0, b1 = res["battery_traces"]
+        return sum(abs(a - b) for a, b in zip(b0, b1, strict=True)) / len(b0)
+
+    def min_battery_idle_fraction(res):
+        b0, b1 = res["battery_traces"]
+        idle = sum(1 for a, b in zip(b0, b1, strict=True) if min(abs(a), abs(b)) < 20)
+        return idle / len(b0)
+
+    # fair splits evenly (tiny imbalance, never idles a unit); eff concentrates.
+    assert imbalance(eff) > 5 * imbalance(fair)
+    assert imbalance(eff) > 100.0
+    assert min_battery_idle_fraction(fair) < 0.1
+    assert min_battery_idle_fraction(eff) > 0.5
+
+
+def test_pv_net_load_scenario_charges_from_real_solar():
+    """The real-PV net-load scenario drives PV + load together from a recorded
+    Cyprus prosumer (partly-cloudy day). Net export charges the battery (SoC
+    rises from its 0.4 start) and the loop tracks the real solar variability
+    well (low mean abs grid). Confirms the bidirectional path runs on real PV
+    rather than the synthetic half-sine."""
+    sc = build_scenarios()["single_venus_pv"]
+    res = asyncio.run(run_scenario(sc, seed=2))
+    # Export-dominated midday: the pack charges up from the 0.4 start.
+    assert res["soc_max"] > 0.45
+    # The loop tracks the net-load (battery absorbs the surplus) without large
+    # residual grid on average.
+    assert res["mean_abs_grid_w"] < 120
+    # The battery is actually working (charging), not idle.
+    assert min(res["battery_traces"][0]) < -20
+
+
+def test_phase_imbalance_nulls_each_phase_independently():
+    """With one Venus per phase and asymmetric per-phase loads, the active-
+    control loop distributes a target to each unit so every phase is nulled —
+    not just the aggregate. Each battery discharges to cover its own phase, and
+    the total grid converges (low mean abs grid), confirming per-phase
+    distribution rather than single-phase steering."""
+    sc = build_scenarios()["phase_imbalance"]
+    res = asyncio.run(run_scenario(sc, seed=1))
+    # The pool tracks the (3-phase) load well overall.
+    assert res["mean_abs_grid_w"] < 150
+    # All three units (one per phase) are discharging to cover their phase.
+    means = [sum(t) / len(t) for t in res["battery_traces"]]
+    assert len(means) == 3
+    assert all(m > 100 for m in means)
+
+
+def test_soc_saturation_scenarios_hit_the_edges():
+    """The drain/fill scenarios actually push the pack into empty/full
+    saturation, exercising the handoff to the grid. Once saturated the battery
+    can't help, so the *avoidable* energy is a small fraction of the total grid
+    exchange (most of it is unavoidable physics, correctly excluded)."""
+    sc = build_scenarios()
+    drain = asyncio.run(run_scenario(sc["single_venus_drain"], seed=1))
+    fill = asyncio.run(run_scenario(sc["single_venus_fill"], seed=1))
+    # Drain empties the pack; grid import takes over and is mostly unavoidable.
+    assert drain["soc_min"] < 0.05
+    assert drain["import_wh"] > 100
+    assert drain["avoidable_import_wh"] < 0.3 * drain["import_wh"]
+    # Fill tops out the pack; surplus is exported and mostly unavoidable.
+    assert fill["soc_max"] > 0.95
+    assert fill["export_wh"] > 100
+    assert fill["avoidable_export_wh"] < 0.3 * fill["export_wh"]
+
+
+def test_slow_meter_variant_tracks_worse_than_default():
+    """A slow meter (fresh reading only every ~10 s) makes the loop act on
+    badly stale data, so it mistracks far more than the same scenario on the
+    realistic ~1 s default meter. The slow variant exists to cover meters that
+    emit a point only ~once per 10 s; here we assert it is meaningfully harder,
+    not a specific (poor) score."""
+    sc = build_scenarios()
+    fast = asyncio.run(run_scenario(sc["single_venus_steps"], seed=1))
+    slow = asyncio.run(run_scenario(sc["single_venus_steps_slow"], seed=1))
+    assert sc["single_venus_steps_slow"].meter_interval_s == 10.0
+    # Coarse 10 s sampling drives a large grid swing the 1 s meter avoids.
+    assert slow["grid_p2p_w"] > 2 * fast["grid_p2p_w"]
 
 
 def test_meter_latency_drives_sustained_oscillation():
@@ -581,6 +749,9 @@ class TestRampPacingRegression:
             duration_s=duration,
             base_load=[300.0, 0.0, 0.0],
             base_noise=0.0,
+            # Isolate the ramp-pacing regression from meter latency (the suite
+            # default): this test asserts controller-pacing overshoot bounds.
+            meter_latency_s=0.0,
             build_events=events,
         )
 

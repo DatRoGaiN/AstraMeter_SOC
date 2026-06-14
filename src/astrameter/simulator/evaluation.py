@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import functools
 import itertools
 import json
 import math
@@ -61,12 +62,13 @@ import sys
 from collections.abc import Callable, Sequence
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from astrameter.ct002.balancer import device_capabilities
 from astrameter.ct002.ct002 import CT002
 
 from .battery import BatterySimulator
-from .load_model import Load, LoadModel
+from .load_model import Load, LoadModel, load_net_trace, load_power_trace
 from .powermeter_sim import PowermeterSimulator
 
 # Mock-time epoch all scenarios start from (any fixed value works; using a
@@ -154,13 +156,16 @@ class Scenario:
     # Real grid meters report with latency; the controller acts on a reading
     # refreshed at this cadence (matching a typical ~1 s powermeter poll /
     # THROTTLE_INTERVAL) while the metrics see the true instantaneous grid.
+    # Slow sources (some HTTP/MQTT meters) only emit a fresh point every ~10 s.
     meter_interval_s: float = 1.0
     # Transport/measurement delay on top of the refresh interval: the value the
     # controller reads reflects the true grid as it was this many seconds ago
     # (a P1 dongle / HA push sensor measures, then takes time to arrive). Acting
     # on a stale reading is a classic driver of sustained oscillation, so this
-    # is what reproduces a loop that hunts instead of settling. 0 = no delay.
-    meter_latency_s: float = 0.0
+    # is what reproduces a loop that hunts instead of settling. The default is a
+    # realistic slight delay for a common ~1 s meter (no real meter is delay-
+    # free); set 0.0 only to isolate controller behaviour from meter latency.
+    meter_latency_s: float = 0.5
 
 
 @dataclass
@@ -180,6 +185,11 @@ class EvalWorld:
                 ld.active = active
                 return
         raise KeyError(f"no load named {name!r}")
+
+    def set_base(self, watts: float, phase_index: int = 0) -> None:
+        """Set the base (whole-house) load on a phase — used to replay a
+        recorded power trace as the scenario's background consumption."""
+        self.load_model.base_load[phase_index] = watts
 
     def set_solar_curve(self, watts: float) -> None:
         self.solar_curve_w = watts
@@ -218,7 +228,15 @@ class _EvalClock:
 @dataclass(frozen=True)
 class _Sample:
     t: float  # seconds since scenario start
-    grid: float  # grid total W as seen by the controller (before_send)
+    # Instantaneous *true* grid total W at this tick (sum of true_grid phases) --
+    # the physical ground truth, NOT the delayed value the controller reads from
+    # the meter cache. Recorded in before_send for the metrics/plots.
+    grid: float
+    # Raw whole-house consumption (load + noise - solar) at this instant, taken
+    # straight from the load model — the original source data, not derived from
+    # grid+battery, so the plotted consumption can never be polluted by control-
+    # loop oscillation (which lives in `grid`).
+    consumption: float
     powers: tuple[float, ...]
     socs: tuple[float, ...]
 
@@ -296,7 +314,11 @@ async def run_scenario(
 
     async def before_send(_addr, _fields=None, _consumer_id=None):
         now = clock() - _EPOCH
-        true_grid = powermeter.compute_grid()
+        # Draw the house load once; derive both the true grid and the raw
+        # consumption from that same sample (get_grid_contribution re-draws
+        # noise each call, so a second call would decorrelate them).
+        contribution = load_model.get_grid_contribution()
+        true_grid = powermeter.compute_grid_from(contribution)
         grid_history.append((now, true_grid))
         # Drop history older than what the delayed read can still need.
         horizon = now - scenario.meter_latency_s - scenario.meter_interval_s - 1.0
@@ -319,6 +341,7 @@ async def run_scenario(
             _Sample(
                 t=now,
                 grid=true_grid["phase_a"] + true_grid["phase_b"] + true_grid["phase_c"],
+                consumption=contribution[0] + contribution[1] + contribution[2],
                 powers=tuple(b.current_power for b in batteries),
                 socs=tuple(b.soc for b in batteries),
             )
@@ -525,11 +548,20 @@ def _compute_metrics(
                 avoid_export_wh += -wh
         travel_w += sum(abs(cur.powers[i] - prev.powers[i]) for i in range(len(specs)))
 
+    # Lowest / highest state of charge any battery reached over the run — lets a
+    # scenario verify it actually drives the pack into empty/full saturation
+    # (not reported in the metric tables; available for tests and context).
+    all_socs = [soc for s in samples for soc in s.socs]
+    soc_min = round(min(all_socs), 3) if all_socs else 0.0
+    soc_max = round(max(all_socs), 3) if all_socs else 0.0
+
     return {
         "scenario": scenario.name,
         "seed": seed,
         "duration_h": round(duration_h, 3),
         "samples": len(samples),
+        "soc_min": soc_min,
+        "soc_max": soc_max,
         "events_measured": events_measured,
         "unsettled_events": unsettled,
         "settle_mean_s": round(sum(settle_times) / len(settle_times), 1)
@@ -552,12 +584,13 @@ def _compute_metrics(
         "grid_trace": _downsample_series(
             samples, scenario.duration_s, lambda s: s.grid
         ),
-        # Net house consumption at the meter coupling = grid + Σ(battery AC
-        # output) by energy balance.  It's the same scripted load in base and
-        # head, so one trace is enough; the HTML grid chart overlays it as
-        # context (grid = consumption minus battery output).
+        # Raw whole-house consumption, recorded straight from the load model
+        # (the original source data — not derived from grid+battery, so it can't
+        # be polluted by control-loop oscillation). It's the same scripted load
+        # in base and head, so one trace is enough; the HTML grid chart overlays
+        # it as context (grid = consumption minus battery output).
         "consumption_trace": _downsample_series(
-            samples, scenario.duration_s, lambda s: s.grid + sum(s.powers)
+            samples, scenario.duration_s, lambda s: s.consumption
         ),
         # Per-battery output traces (one downsampled series each) and labels,
         # for the per-scenario battery-output chart in the HTML report.
@@ -597,6 +630,15 @@ _EFF_MODE: dict[str, float] = {
     "efficiency_rotation_interval": 900.0,
 }
 
+# Efficiency knobs for the real-trace two-Venus scenario. The concentration
+# cut-in is roughly at total load = 2 x min_efficient_power (for two units), so a
+# higher floor than the default 150 W is needed to land that threshold inside the
+# recorded load's range: at 500 W the second Venus idles on the calm overnight
+# base (~66% of the run) and cuts in on the morning/cooking peaks (~33%). With
+# the default 150 W floor both units stay active the whole run and /eff would be
+# an exact copy of /fair.
+_TRACE_EFF_MODE: dict[str, float] = {**_EFF_MODE, "min_efficient_power": 500.0}
+
 
 # Typed closure factories for event actions (a plain lambda with extra
 # defaulted parameters doesn't type-check against ``Callable[[EvalWorld], None]``).
@@ -626,6 +668,24 @@ def _set_solar_factor(factor: float) -> Callable[[EvalWorld], None]:
 def _set_dc_input(battery_index: int, watts: float) -> Callable[[EvalWorld], None]:
     def apply(w: EvalWorld) -> None:
         w.set_dc_input(battery_index, watts)
+
+    return apply
+
+
+def _set_base(watts: float) -> Callable[[EvalWorld], None]:
+    def apply(w: EvalWorld) -> None:
+        w.set_base(watts)
+
+    return apply
+
+
+def _set_net(load_w: float, pv_w: float) -> Callable[[EvalWorld], None]:
+    """Set the base load and the solar (PV) curve together from one recorded
+    net-load sample, so the two stay correlated (same site, same instant)."""
+
+    def apply(w: EvalWorld) -> None:
+        w.set_base(load_w)
+        w.set_solar_curve(pv_w)
 
     return apply
 
@@ -672,6 +732,15 @@ _HOUSEHOLD_LOADS = [
     Load("kettle", 2000.0, "A"),
     Load("oven", 1500.0, "A"),
     Load("dishwasher", 1100.0, "A"),
+]
+
+# Same appliances spread one-per-phase, for the three-phase imbalance scenario
+# (everything else in the suite is single-phase A). Names match _household_steps
+# so the same scripted schedule drives them.
+_PHASE_IMBALANCE_LOADS = [
+    Load("kettle", 2000.0, "A"),
+    Load("oven", 1500.0, "B"),
+    Load("dishwasher", 1100.0, "C"),
 ]
 
 # Washing-machine drum motor: a single ~120 W load the main-wash tumble runs,
@@ -748,6 +817,146 @@ def _no_events(_rng: random.Random) -> list[Event]:
     and scored on the sustained-oscillation aggregates (the step-response metrics
     read 0 with no labeled events)."""
     return []
+
+
+# Real household whole-house power trace (RAE House 1, 1 Hz, CC BY — see
+# traces/README.md). Unlike the synthetic base load + IID noise, a recorded
+# trace carries the *correlated drift* and *persistent appliance switching* of a
+# real home, so it rewards a balancer that tracks genuine load changes instead
+# of one tuned to reject white noise (which over-damps and then lags in the
+# field). Loaded lazily on first use (not at import) and cached; scenarios slice
+# a per-seed window from it.
+_TRACE_DIR = Path(__file__).parent / "traces"
+
+
+@functools.cache
+def _household_trace() -> list[tuple[float, float]]:
+    """Lazily load + cache the real household power trace (RAE House 1).
+
+    Loading on first use rather than at import keeps the module import (and so
+    ``--help`` / importing helpers for tests) side-effect-free, and turns a
+    missing trace into a clear, scenario-specific error instead of an opaque
+    import-time traceback. The vendored CSVs are dev/eval-only data and aren't
+    shipped in the wheel.
+    """
+    path = _TRACE_DIR / "rae_household.csv"
+    try:
+        return load_power_trace(path)
+    except OSError as exc:
+        raise RuntimeError(
+            f"Real-trace scenario needs the household trace at {path}, which "
+            "isn't available (dev/eval-only data, not packaged) — run from a "
+            "source checkout. See traces/README.md."
+        ) from exc
+
+
+# Small measurement noise laid over the recorded trace: a real CT/meter adds a
+# few watts of jitter on top of the true house power. The 1 Hz trace already
+# carries real second-to-second structure, so this only models meter noise (not
+# a zero-order-hold fill).
+_TRACE_METER_NOISE = 10.0
+
+
+def _trace_events(rng: random.Random, duration: float) -> list[Event]:
+    """Replay a per-seed window of the real household trace as the base load.
+
+    Each seed picks a different start offset into the recording (so seeds see
+    genuinely different load regimes — quiet stretches vs cooking spikes — not
+    just re-randomised noise), then the recorded samples drive the whole-house
+    base load over the run. The events are **unlabelled**: real load changes
+    aren't clean single steps, so (like the washer/noisy scenarios) this is
+    scored on the sustained-oscillation/energy aggregates rather than per-step
+    settling. A balancer that tracks the real load without hunting drives those
+    down.
+    """
+    trace = _household_trace()
+    t0 = trace[0][0]
+    span = trace[-1][0] - t0
+    max_off = max(0.0, span - duration)
+    start = rng.uniform(0.0, max_off)
+    events: list[Event] = []
+    for t, watts in trace:
+        rel = (t - t0) - start
+        if rel < 0.0:
+            continue
+        if rel > duration:
+            break
+        events.append(Event(at=rel, apply=_set_base(watts)))
+    # Anchor the base load from t=0 to the sample active at `start`, so the run
+    # opens on real load rather than the Scenario's placeholder base_load.
+    if not events or events[0].at > 0.0:
+        first = trace[0][1]
+        for t, watts in trace:
+            if (t - t0) <= start:
+                first = watts
+            else:
+                break
+        events.insert(0, Event(at=0.0, apply=_set_base(first)))
+    return events
+
+
+# Real prosumer net-load trace (Cyprus, 30 s, CC BY — see traces/README.md):
+# matching PV generation + load from one site, so their timing is genuinely
+# correlated. A partly-cloudy day, so the PV carries real cloud transients the
+# synthetic half-sine lacks. Scaled to a balcony-system size (keeps PV under the
+# load model's 2 kW solar clamp while preserving the cloud-dip shape).
+# Loaded lazily on first use (not at import) and cached, like the household trace.
+_PV_SCALE = 0.45
+
+
+@functools.cache
+def _net_trace() -> list[tuple[float, float, float]]:
+    """Lazily load + cache the real prosumer net-load trace (Cyprus).
+
+    Same lazy/cached rationale as :func:`_household_trace`.
+    """
+    path = _TRACE_DIR / "cyprus_netload.csv"
+    try:
+        return load_net_trace(path)
+    except OSError as exc:
+        raise RuntimeError(
+            f"PV-net scenario needs the net-load trace at {path}, which isn't "
+            "available (dev/eval-only data, not packaged) — run from a source "
+            "checkout. See traces/README.md."
+        ) from exc
+
+
+def _pv_net_events(rng: random.Random, duration: float) -> list[Event]:
+    """Replay a per-seed window of the real PV + load net-load trace.
+
+    Drives the base load and the solar (PV) curve together from the same
+    recorded sample (so they stay correlated), scaled by :data:`_PV_SCALE`. Each
+    seed slices a different offset, so seeds see different parts of the day
+    (morning ramp, cloudy midday, afternoon). Unlabelled — scored on the
+    sustained-oscillation/energy aggregates, like the load-trace scenarios.
+    """
+    trace = _net_trace()
+    t0 = trace[0][0]
+    span = trace[-1][0] - t0
+    max_off = max(0.0, span - duration)
+    start = rng.uniform(0.0, max_off)
+    events: list[Event] = []
+    for t, load_w, pv_w in trace:
+        rel = (t - t0) - start
+        if rel < 0.0:
+            continue
+        if rel > duration:
+            break
+        events.append(
+            Event(at=rel, apply=_set_net(load_w * _PV_SCALE, pv_w * _PV_SCALE))
+        )
+    # Anchor both load and PV from t=0 to the sample active at `start`.
+    if not events or events[0].at > 0.0:
+        first = trace[0]
+        for sample in trace:
+            if (sample[0] - t0) <= start:
+                first = sample
+            else:
+                break
+        events.insert(
+            0, Event(at=0.0, apply=_set_net(first[1] * _PV_SCALE, first[2] * _PV_SCALE))
+        )
+    return events
 
 
 def _solar_curve(duration: float, peak: float) -> list[Event]:
@@ -832,6 +1041,23 @@ def build_scenarios() -> dict[str, Scenario]:
         )
     )
 
+    add(
+        Scenario(
+            name="single_venus_steps_slow",
+            description=(
+                "One Venus, stepped house load over a slow meter (fresh reading "
+                "only every 10 s + ~1 s delay) — coarse-sampling stress, cf. "
+                "single_venus_steps"
+            ),
+            batteries=[_VENUS],
+            duration_s=dur_steps,
+            loads=list(_HOUSEHOLD_LOADS),
+            build_events=lambda rng: _household_steps(rng, dur_steps),
+            meter_interval_s=10.0,
+            meter_latency_s=1.0,
+        )
+    )
+
     dur_washer = 1800.0
     add(
         Scenario(
@@ -871,6 +1097,27 @@ def build_scenarios() -> dict[str, Scenario]:
         )
     )
 
+    add(
+        Scenario(
+            name="single_venus_trace",
+            description=(
+                "One Venus, real recorded household load (RAE House 1, 1 Hz "
+                "trace, CC BY) over a meter with realistic ~0.8 s latency — "
+                "real-world correlated-load stress (cf. the synthetic-noise "
+                "single_venus_noisy)"
+            ),
+            batteries=[_VENUS],
+            duration_s=dur_steps,
+            base_load=[_household_trace()[0][1], 0.0, 0.0],
+            base_noise=_TRACE_METER_NOISE,
+            build_events=lambda rng: _trace_events(rng, dur_steps),
+            # Real installs read the meter with measurement+transport delay;
+            # pairing the real load with realistic latency is the field condition
+            # the synthetic latency-free scenarios never cover.
+            meter_latency_s=0.8,
+        )
+    )
+
     dur_solar = 5400.0
     solar_peak = 1800.0
     add(
@@ -883,6 +1130,84 @@ def build_scenarios() -> dict[str, Scenario]:
             build_events=lambda rng: (
                 _solar_curve(dur_solar, solar_peak) + _cloud_dips(rng, dur_solar)
             ),
+        )
+    )
+
+    add(
+        Scenario(
+            name="single_venus_solar_slow",
+            description=(
+                "One Venus, solar day + clouds over a slow meter (fresh reading "
+                "only every 10 s + ~1 s delay) — coarse sampling of a moving PV "
+                "setpoint, cf. single_venus_solar"
+            ),
+            batteries=[BatterySpec(initial_soc=0.4)],
+            duration_s=dur_solar,
+            base_load=[400.0, 0.0, 0.0],
+            build_events=lambda rng: (
+                _solar_curve(dur_solar, solar_peak) + _cloud_dips(rng, dur_solar)
+            ),
+            meter_interval_s=10.0,
+            meter_latency_s=1.0,
+        )
+    )
+
+    # SoC-saturation scenarios: short runs against a 5 kWh pack barely move the
+    # SoC, so the empty/full handoff (battery stops discharging/charging and the
+    # grid must take over) was never exercised. These use a realistic single-unit
+    # 2.56 kWh pack started near an edge and driven hard enough to hit it.
+    dur_drain = 10800.0  # 3 h
+    add(
+        Scenario(
+            name="single_venus_drain",
+            description=(
+                "One Venus emptying under a sustained real evening load (2.56 kWh "
+                "pack, low initial SoC) — empty-saturation handoff to grid import"
+            ),
+            batteries=[BatterySpec(capacity_wh=2560.0, initial_soc=0.35)],
+            duration_s=dur_drain,
+            base_load=[_household_trace()[0][1], 0.0, 0.0],
+            base_noise=_TRACE_METER_NOISE,
+            build_events=lambda rng: _trace_events(rng, dur_drain),
+            meter_latency_s=0.5,
+        )
+    )
+
+    add(
+        Scenario(
+            name="single_venus_fill",
+            description=(
+                "One Venus filling under a strong solar day (2.56 kWh pack, high "
+                "initial SoC) — full-saturation handoff: charge clamp + export"
+            ),
+            batteries=[BatterySpec(capacity_wh=2560.0, initial_soc=0.8)],
+            duration_s=dur_solar,
+            base_load=[300.0, 0.0, 0.0],
+            build_events=lambda rng: (
+                _solar_curve(dur_solar, 2200.0) + _cloud_dips(rng, dur_solar)
+            ),
+            meter_latency_s=0.5,
+        )
+    )
+
+    # Real PV net-load: matching recorded PV + load from one Cyprus prosumer on a
+    # partly-cloudy day, replacing the synthetic half-sine + scripted cloud dips
+    # with genuine PV cloud transients. Exercises the bidirectional loop (charge
+    # on export, discharge on cloud dips) against real solar variability.
+    add(
+        Scenario(
+            name="single_venus_pv",
+            description=(
+                "One Venus, real recorded PV + load net-load (Cyprus prosumer, "
+                "30 s, real cloud transients) — bidirectional charge/export "
+                "tracking, cf. the synthetic single_venus_solar"
+            ),
+            batteries=[BatterySpec(initial_soc=0.4)],
+            duration_s=dur_solar,
+            base_load=[_net_trace()[0][1] * _PV_SCALE, 0.0, 0.0],
+            base_noise=_TRACE_METER_NOISE,
+            build_events=lambda rng: _pv_net_events(rng, dur_solar),
+            meter_latency_s=0.5,
         )
     )
 
@@ -956,6 +1281,47 @@ def build_scenarios() -> dict[str, Scenario]:
             )
         )
 
+    add(
+        Scenario(
+            name="two_venus_slow/fair",
+            description=(
+                "Two Venus sharing one phase, stepped load over a slow meter "
+                "(fresh reading only every 10 s + ~1 s delay) — coarse sampling "
+                "with share-splitting, cf. two_venus/fair"
+            ),
+            batteries=[_VENUS, _VENUS],
+            duration_s=dur_steps,
+            loads=list(_HOUSEHOLD_LOADS),
+            build_events=lambda rng: _household_steps(rng, dur_steps),
+            meter_interval_s=10.0,
+            meter_latency_s=1.0,
+        )
+    )
+
+    # Three-phase imbalance: one Venus per phase with asymmetric per-phase base
+    # loads and a different appliance on each phase. Everything else in the suite
+    # is single-phase (load + batteries on A); this exercises the active-control
+    # loop's per-phase target distribution — each unit must null only its own
+    # phase, with no cross-phase interference.
+    add(
+        Scenario(
+            name="phase_imbalance",
+            description=(
+                "Three Venus, one per phase; asymmetric per-phase base + a "
+                "different appliance on each phase — per-phase distribution"
+            ),
+            batteries=[
+                BatterySpec(phase="A"),
+                BatterySpec(phase="B"),
+                BatterySpec(phase="C"),
+            ],
+            duration_s=dur_steps,
+            base_load=[300.0, 200.0, 150.0],
+            loads=list(_PHASE_IMBALANCE_LOADS),
+            build_events=lambda rng: _household_steps(rng, dur_steps),
+        )
+    )
+
     for mode, kwargs in (("fair", {}), ("eff", _EFF_MODE)):
         add(
             Scenario(
@@ -969,6 +1335,34 @@ def build_scenarios() -> dict[str, Scenario]:
                 base_load=list(_NOISY_BASE_LOAD),
                 base_noise=_NOISY_BASE_NOISE,
                 build_events=_no_events,
+                ct_kwargs=dict(kwargs),
+            )
+        )
+
+    # fair always splits the load across both units; eff (with the raised
+    # _TRACE_EFF_MODE floor) concentrates on one Venus during the calm base and
+    # lets the second cut in on peaks — so the two variants differ under a real
+    # load instead of /eff duplicating /fair (which it does at the default floor).
+    for mode, kwargs in (("fair", {}), ("eff", _TRACE_EFF_MODE)):
+        suffix = (
+            "fair-share splitting across both units"
+            if mode == "fair"
+            else "efficiency concentration: the 2nd Venus cuts in only on peaks"
+        )
+        add(
+            Scenario(
+                name=f"two_venus_trace/{mode}",
+                description=(
+                    "Two Venus sharing one phase, real recorded household load "
+                    "(RAE House 1, 1 Hz trace, CC BY) over a ~0.8 s-latency "
+                    f"meter — {suffix}"
+                ),
+                batteries=[_VENUS, _VENUS],
+                duration_s=dur_steps,
+                base_load=[_household_trace()[0][1], 0.0, 0.0],
+                base_noise=_TRACE_METER_NOISE,
+                build_events=lambda rng: _trace_events(rng, dur_steps),
+                meter_latency_s=0.8,
                 ct_kwargs=dict(kwargs),
             )
         )
