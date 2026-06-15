@@ -201,14 +201,14 @@ BALANCER_SCHEMA = cv.Schema(
             min=0.0
         ),
         cv.Optional(CONF_MAX_TARGET_STEP, default=0.0): cv.float_range(min=0.0),
-        cv.Optional(CONF_PACE_BASE_STEP, default=50.0): cv.float_range(min=0.0),
-        cv.Optional(CONF_PACE_MAX_STEP, default=200.0): cv.float_range(min=0.0),
-        cv.Optional(CONF_OSC_DAMP_MAX, default=0.8): cv.float_range(min=0.0, max=1.0),
-        cv.Optional(CONF_OSC_DAMP_ALPHA, default=0.15): cv.float_range(
+        cv.Optional(CONF_PACE_BASE_STEP, default=30.0): cv.float_range(min=0.0),
+        cv.Optional(CONF_PACE_MAX_STEP, default=100.0): cv.float_range(min=0.0),
+        cv.Optional(CONF_OSC_DAMP_MAX, default=0.95): cv.float_range(min=0.0, max=1.0),
+        cv.Optional(CONF_OSC_DAMP_ALPHA, default=0.3): cv.float_range(min=0.0, max=1.0),
+        cv.Optional(CONF_OSC_DAMP_DECAY, default=0.05): cv.float_range(
             min=0.0, max=1.0
         ),
-        cv.Optional(CONF_OSC_DAMP_DECAY, default=0.1): cv.float_range(min=0.0, max=1.0),
-        cv.Optional(CONF_OSC_DAMP_THRESHOLD, default=450.0): cv.float_range(min=0.0),
+        cv.Optional(CONF_OSC_DAMP_THRESHOLD, default=300.0): cv.float_range(min=0.0),
         cv.Optional(CONF_MIN_EFFICIENT_POWER, default=0.0): cv.float_range(min=0.0),
         cv.Optional(CONF_PROBE_MIN_POWER, default=80.0): cv.float_range(min=0.0),
         cv.Optional(
@@ -448,12 +448,12 @@ async def to_code(config):
         ("error_reduce_threshold", bal.get(CONF_ERROR_REDUCE_THRESHOLD, 20.0)),
         ("max_correction_per_step", bal.get(CONF_MAX_CORRECTION_PER_STEP, 80.0)),
         ("max_target_step", bal.get(CONF_MAX_TARGET_STEP, 0.0)),
-        ("pace_base_step", bal.get(CONF_PACE_BASE_STEP, 50.0)),
-        ("pace_max_step", bal.get(CONF_PACE_MAX_STEP, 200.0)),
-        ("osc_damp_max", bal.get(CONF_OSC_DAMP_MAX, 0.8)),
-        ("osc_damp_alpha", bal.get(CONF_OSC_DAMP_ALPHA, 0.15)),
-        ("osc_damp_decay", bal.get(CONF_OSC_DAMP_DECAY, 0.1)),
-        ("osc_damp_threshold", bal.get(CONF_OSC_DAMP_THRESHOLD, 450.0)),
+        ("pace_base_step", bal.get(CONF_PACE_BASE_STEP, 30.0)),
+        ("pace_max_step", bal.get(CONF_PACE_MAX_STEP, 100.0)),
+        ("osc_damp_max", bal.get(CONF_OSC_DAMP_MAX, 0.95)),
+        ("osc_damp_alpha", bal.get(CONF_OSC_DAMP_ALPHA, 0.3)),
+        ("osc_damp_decay", bal.get(CONF_OSC_DAMP_DECAY, 0.05)),
+        ("osc_damp_threshold", bal.get(CONF_OSC_DAMP_THRESHOLD, 300.0)),
         ("min_efficient_power", bal.get(CONF_MIN_EFFICIENT_POWER, 0.0)),
         ("probe_min_power", bal.get(CONF_PROBE_MIN_POWER, 80.0)),
         (
