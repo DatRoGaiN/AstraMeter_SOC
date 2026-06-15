@@ -102,7 +102,8 @@ void BalancerConfig::clamp() {
   if (probe_min_power < 0.0f) probe_min_power = 0.0f;
   if (efficiency_rotation_interval < 1.0f) efficiency_rotation_interval = 1.0f;
   clamp_v(efficiency_fade_alpha, 0.01f, 1.0f);
-  clamp_v(efficiency_saturation_threshold, 0.0f, 1.0f);
+  efficiency_saturation_threshold =
+      std::max(0.0, std::min(1.0, efficiency_saturation_threshold));
   if (min_dc_output < 0.0f) min_dc_output = 0.0f;
   if (pace_base_step < 0.0f) pace_base_step = 0.0f;
   if (pace_max_step < pace_base_step) pace_max_step = pace_base_step;
@@ -110,20 +111,21 @@ void BalancerConfig::clamp() {
   clamp_v(osc_damp_alpha, 0.0f, 1.0f);
   clamp_v(osc_damp_decay, 0.0f, 1.0f);
   if (osc_damp_threshold < 0.0f) osc_damp_threshold = 0.0f;
+  clamp_v(grid_predict_trust, 0.0f, 1.0f);
 }
 
 // -------------------------------------------------------------------------
 // SaturationTracker
 // -------------------------------------------------------------------------
 
-SaturationTracker::SaturationTracker(float alpha, float min_target, float decay_factor,
+SaturationTracker::SaturationTracker(double alpha, float min_target, double decay_factor,
                                      float stall_timeout_seconds, bool enabled,
                                      std::function<double()> clock)
     : clock_(std::move(clock)),
       enabled_(enabled),
-      alpha_(std::max(0.01f, std::min(1.0f, alpha))),
+      alpha_(std::max(0.01, std::min(1.0, alpha))),
       min_target_(std::max(1.0f, min_target)),
-      decay_factor_(std::max(0.0f, std::min(1.0f, decay_factor))),
+      decay_factor_(std::max(0.0, std::min(1.0, decay_factor))),
       stall_timeout_seconds_(std::max(0.0f, stall_timeout_seconds)) {}
 
 void SaturationTracker::update(BalancerConsumerState &state,
@@ -200,8 +202,8 @@ void SaturationTracker::clear(BalancerConsumerState &state) {
 // LoadBalancer
 // -------------------------------------------------------------------------
 
-LoadBalancer::LoadBalancer(BalancerConfig config, float saturation_alpha,
-                           float saturation_min_target, float saturation_decay_factor,
+LoadBalancer::LoadBalancer(BalancerConfig config, double saturation_alpha,
+                           float saturation_min_target, double saturation_decay_factor,
                            float saturation_grace_seconds,
                            float saturation_stall_timeout_seconds,
                            bool saturation_enabled, std::function<double()> clock,
@@ -311,13 +313,13 @@ void LoadBalancer::commit_probe_(const ReportMap &reports, double now, float act
   if (total_actual > 0.0) {
     for (const auto &cid : participants) {
       auto it = reports.find(cid);
-      const float share = it != reports.end() ? std::fabs(it->second.power) : 0.0f;
-      this->get_consumer_(cid).fade_weight = static_cast<float>(share / total_actual);
+      const double share = it != reports.end() ? std::fabs(it->second.power) : 0.0;
+      this->get_consumer_(cid).fade_weight = share / total_actual;
     }
   } else {
     const size_t active_count = std::max<size_t>(1, probe.active_ids.size());
     for (const auto &cid : probe.active_ids)
-      this->get_consumer_(cid).fade_weight = 1.0f / active_count;
+      this->get_consumer_(cid).fade_weight = 1.0 / active_count;
     for (const auto &cid : probe.backup_ids) this->get_consumer_(cid).fade_weight = 0.0f;
   }
   this->post_probe_fade_until_ = now + std::min(5.0f, this->probe_timeout_seconds_);
@@ -750,6 +752,13 @@ std::optional<float> LoadBalancer::get_last_intent(const std::string &consumer_i
 std::array<float, 3> LoadBalancer::compute_auto_target_(
     const std::optional<std::string> &consumer_id, const ReportMap &reports,
     float grid_total, const std::vector<float> &sample_id) {
+  // Predicted grid the residual/fair-share control acts on (compensates for
+  // meter latency; see predict_control_grid_). Updated on every call so the
+  // estimate stays continuous across the probe / fading / charge-blind early
+  // returns, which keep using the raw meter for their categorical decisions;
+  // only the steady residual loop below acts on the prediction.
+  const float control_grid = this->predict_control_grid_(reports, grid_total, sample_id);
+
   std::unordered_map<std::string, float> saturation;
   for (const auto &c : this->consumers_)
     saturation[c.first] = static_cast<float>(c.second.saturation_score);
@@ -806,16 +815,16 @@ std::array<float, 3> LoadBalancer::compute_auto_target_(
 
   if (any_fading && consumer_id) {
     auto &state = this->get_consumer_(*consumer_id);
-    const float fade_w = state.fade_weight;
+    const double fade_w = state.fade_weight;
     auto it = reports.find(*consumer_id);
     const float reported = (it != reports.end()) ? it->second.power : 0.0f;
-    if (fade_w == 0.0f) return this->steer_to_zero_(consumer_id, reports, /*paced=*/true);
+    if (fade_w == 0.0) return this->steer_to_zero_(consumer_id, reports, /*paced=*/true);
     float total_battery = 0.0f;
     for (const auto &r : reports) total_battery += r.second.power;
-    const float demand = total_battery + grid_total;
-    float total_fade = 0.0f;
+    const double demand = static_cast<double>(total_battery) + grid_total;
+    double total_fade = 0.0;
     for (const auto &r : reports) total_fade += this->get_consumer_(r.first).fade_weight;
-    const float desired = (total_fade > 0.0f) ? demand * fade_w / total_fade : 0.0f;
+    const double desired = (total_fade > 0.0) ? demand * fade_w / total_fade : 0.0;
     float reading = to_grid_reading(NetOutputW(desired), reported);
     reading = this->pace_reading_(*consumer_id, reading, reported);
     state.last_target = reading;
@@ -850,10 +859,10 @@ std::array<float, 3> LoadBalancer::compute_auto_target_(
   float fair_share;
   if (consumer_id && reports.count(*consumer_id)) {
     const float w = share_part.count(*consumer_id) ? share_part[*consumer_id] : 1.0f;
-    fair_share = (total_effective > 0.0f) ? (grid_total / total_effective) * w
-                                          : grid_total / num_consumers;
+    fair_share = (total_effective > 0.0f) ? (control_grid / total_effective) * w
+                                          : control_grid / num_consumers;
   } else {
-    fair_share = grid_total / num_consumers;
+    fair_share = control_grid / num_consumers;
   }
 
   // fair_share / balance_correction_ produce the residual: this consumer's
@@ -869,7 +878,8 @@ std::array<float, 3> LoadBalancer::compute_auto_target_(
   } else {
     residual = fair_share;
   }
-  if ((grid_total < 0.0f && residual > 0.0f) || (grid_total > 0.0f && residual < 0.0f)) {
+  if ((control_grid < 0.0f && residual > 0.0f) ||
+      (control_grid > 0.0f && residual < 0.0f)) {
     residual = 0.0f;
   }
   if (consumer_id) {
@@ -917,6 +927,50 @@ float LoadBalancer::damp_oscillation_(const std::string &consumer_id, float resi
   }
   if (sign != 0) state.osc_last_sign = sign;
   return residual * (1.0f - this->cfg_.osc_damp_max * state.osc_score);
+}
+
+// Online grid-state observer that compensates for meter latency without
+// per-meter tuning. Two signals see the same grid at different delays: the
+// batteries' self-reported output (fresh) and the grid meter (latent). Every
+// call the estimate is advanced by the pool's actual reported output change
+// (grid moves opposite to net output), crediting an in-flight correction
+// before the meter shows it — so the loop never re-issues (and winds up) a
+// correction already delivered. On a fresh meter sample the estimate is pulled
+// toward the reading by an adaptive trust: a sustained same-sign innovation run
+// (a genuine disturbance) raises it additively so steps are tracked fast, while
+// a sign flip (latency-driven hunting) shrinks it multiplicatively so the fast
+// prediction dominates and the hunt is starved. Returns the raw meter when
+// disabled. Mirrors balancer.py LoadBalancer._predict_control_grid.
+float LoadBalancer::predict_control_grid_(const ReportMap &reports, float grid_total,
+                                          const std::vector<float> &sample_id) {
+  if (this->cfg_.grid_predict_trust <= 0.0f) return grid_total;
+  float pool_output = 0.0f;
+  for (const auto &r : reports) pool_output += r.second.power;
+  if (!this->pred_grid_.has_value()) {
+    this->pred_grid_ = grid_total;
+    this->pred_pool_output_ = pool_output;
+    this->pred_sample_id_ = sample_id;
+    this->pred_trust_ =
+        std::min(PRED_TRUST_MAX, std::max(PRED_TRUST_MIN, this->cfg_.grid_predict_trust));
+    return grid_total;
+  }
+  *this->pred_grid_ -= pool_output - this->pred_pool_output_;
+  this->pred_pool_output_ = pool_output;
+  if (!this->pred_sample_id_.has_value() || *this->pred_sample_id_ != sample_id) {
+    this->pred_sample_id_ = sample_id;
+    const float innovation = grid_total - *this->pred_grid_;
+    const int sign = (innovation > 0.0f) ? 1 : (innovation < 0.0f ? -1 : 0);
+    if (std::fabs(innovation) >= PRED_INNOVATION_GATE_W && sign != 0) {
+      if (this->pred_innov_sign_ == 0 || sign == this->pred_innov_sign_) {
+        this->pred_trust_ = std::min(PRED_TRUST_MAX, this->pred_trust_ + PRED_TRUST_RAISE_STEP);
+      } else {
+        this->pred_trust_ = std::max(PRED_TRUST_MIN, this->pred_trust_ * PRED_TRUST_SHRINK);
+      }
+      this->pred_innov_sign_ = sign;
+    }
+    *this->pred_grid_ += this->pred_trust_ * innovation;
+  }
+  return *this->pred_grid_;
 }
 
 // Clamp the auto-path reading to the consumer's ramp-pacing cap (issue #458).
@@ -1113,7 +1167,7 @@ std::unordered_map<std::string, float> LoadBalancer::compute_efficiency_depriori
     }
   }
 
-  const std::string cache_key = serialize_cache_key(sample_id, this->priority_);
+  std::string cache_key = serialize_cache_key(sample_id, this->priority_);
   if (this->cache_sample_.has_value() && *this->cache_sample_ == cache_key) {
     return this->cache_result_;
   }
@@ -1176,6 +1230,12 @@ std::unordered_map<std::string, float> LoadBalancer::compute_efficiency_depriori
       deprioritized.insert(this->priority_[i]);
     result.clear();
     for (const auto &cid : deprioritized) result[cid] = 0.0f;
+    // The swap reordered priority_; recompute the cache key from the *post*-swap
+    // order so the next same-sample tick hits the cache, matching Python
+    // (_compute_efficiency_deprioritized). Storing the pre-swap key here caused
+    // the next tick to miss the cache and re-run the swap/probe machinery,
+    // diverging from the canonical stack.
+    cache_key = serialize_cache_key(sample_id, this->priority_);
     for (size_t i = 0; i < slots && i < this->priority_.size(); ++i) {
       if (pre_swap_active.find(this->priority_[i]) == pre_swap_active.end()) {
         this->saturation_.clear(this->get_consumer_(this->priority_[i]));
@@ -1222,7 +1282,7 @@ bool LoadBalancer::maybe_force_swap_saturated_(std::vector<std::string> &priorit
                                                size_t slots, double now) {
   const auto &cfg = this->cfg_;
   if (cfg.efficiency_saturation_threshold <= 0.0f || slots >= priority.size()) return false;
-  const float threshold = cfg.efficiency_saturation_threshold;
+  const double threshold = cfg.efficiency_saturation_threshold;
   std::optional<size_t> saturated_idx;
   for (size_t i = 0; i < slots; ++i) {
     auto it = this->consumers_.find(priority[i]);
@@ -1261,16 +1321,16 @@ std::unordered_map<std::string, float> LoadBalancer::fade_efficiency_weights_(
       continue;
     }
     auto goal_it = raw_adjustments.find(cid);
-    const float goal = goal_it != raw_adjustments.end() ? goal_it->second : 1.0f;
-    const float prev = state.fade_weight;
-    float effective_alpha = alpha;
+    const double goal = goal_it != raw_adjustments.end() ? goal_it->second : 1.0;
+    const double prev = state.fade_weight;
+    double effective_alpha = alpha;
     if (post_probe_active && this->post_probe_fade_ids_.find(cid) != this->post_probe_fade_ids_.end()) {
-      effective_alpha = std::min(alpha, 0.25f);
+      effective_alpha = std::min<double>(alpha, 0.25);
     }
-    float new_w = prev + effective_alpha * (goal - prev);
-    if (std::fabs(new_w - goal) < 0.05f) new_w = goal;
+    double new_w = prev + effective_alpha * (goal - prev);
+    if (std::fabs(new_w - goal) < 0.05) new_w = goal;
     state.fade_weight = new_w;
-    if (new_w < 1.0f) result[cid] = new_w;
+    if (new_w < 1.0) result[cid] = static_cast<float>(new_w);
   }
   if (!post_probe_active) this->clear_post_probe_fade_();
   // Cleanup consumers no longer in the pool and not in priority_.

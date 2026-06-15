@@ -31,6 +31,20 @@ inline constexpr float PACE_TRACKING_DELTA_W = 5.0f;
 inline constexpr float PACE_GROWTH_FACTOR = 2.0f;
 inline constexpr double PACE_REFERENCE_DT = 1.0;
 
+// Adaptive grid-state predictor (see BalancerConfig::grid_predict_trust and
+// LoadBalancer::predict_control_grid_). The meter trust is bounded to
+// [PRED_TRUST_MIN, PRED_TRUST_MAX] and adapted per fresh meter sample whose
+// innovation clears PRED_INNOVATION_GATE_W. The raise is a small additive step
+// (trust climbs only under a sustained same-sign innovation run — a genuine
+// lasting disturbance) while the shrink is a hard multiplicative cut (a single
+// sign flip, the signature of latency-driven hunting, collapses it). Mirrors
+// balancer.py.
+inline constexpr float PRED_TRUST_MIN = 0.15f;
+inline constexpr float PRED_TRUST_MAX = 0.6f;
+inline constexpr float PRED_TRUST_RAISE_STEP = 0.08f;
+inline constexpr float PRED_TRUST_SHRINK = 0.4f;
+inline constexpr float PRED_INNOVATION_GATE_W = 40.0f;
+
 inline constexpr double EFFICIENCY_HYSTERESIS_FACTOR = 1.2;
 inline constexpr double SATURATION_GRACE_SECONDS = 90.0;
 inline constexpr double SATURATION_STALL_TIMEOUT_SECONDS = 60.0;
@@ -106,10 +120,20 @@ struct BalancerConfig {
   float probe_min_power{80.0f};
   float efficiency_rotation_interval{900.0f};
   float efficiency_fade_alpha{0.15f};
-  float efficiency_saturation_threshold{0.4f};
+  // double (compared against the double saturation_score EMA) so the swap
+  // decision matches the canonical Python double math; a float 0.4f sits a few
+  // 1e-8 above 0.4 and flips the comparison on a knife-edge score, diverging the
+  // deprioritized set from Python.
+  double efficiency_saturation_threshold{0.4};
   // Minimum net discharge (W) to keep an external-inverter DC battery awake.
   // 0 disables. See issue #425 and balancer.py.
   float min_dc_output{0.0f};
+  // Adaptive grid-state predictor: act on a predicted grid that credits the
+  // pool's freshly-reported output between meter refreshes and trusts each
+  // fresh meter sample by an online-learned amount, compensating for meter
+  // latency without per-meter tuning. 0 disables (act on the raw meter); any
+  // positive value only seeds the self-adapting trust. See balancer.py.
+  float grid_predict_trust{0.5f};
 
   void clamp();
 };
@@ -126,7 +150,10 @@ struct BalancerConsumerState {
   // consumer, recorded *before* wire pacing. The cross-talk chrg/dchrg
   // attribution uses it to filter involuntary outputs (issue #376).
   std::optional<float> last_intent;
-  float fade_weight{1.0f};
+  // Long-running EMA weight — double (like saturation_score) so the fade
+  // trajectory and its snap-to-goal threshold match the canonical Python double
+  // math poll-for-poll; float drifts enough to flip the snap on a different poll.
+  double fade_weight{1.0};
   // Ramp-pacing state (see BalancerConfig::pace_base_step): current per-poll
   // cap, sign of the last paced reading, and the battery's reported power at
   // the last pacing step (tracking detection).
@@ -176,7 +203,7 @@ using ReportMap = std::unordered_map<std::string, ConsumerReport>;
 
 class SaturationTracker {
  public:
-  SaturationTracker(float alpha, float min_target, float decay_factor,
+  SaturationTracker(double alpha, float min_target, double decay_factor,
                     float stall_timeout_seconds, bool enabled,
                     std::function<double()> clock);
 
@@ -189,16 +216,19 @@ class SaturationTracker {
  private:
   std::function<double()> clock_;
   bool enabled_;
-  float alpha_;
+  // double (like the saturation_score it drives) so the EMA matches the
+  // canonical Python double math; a float alpha/decay sits ~1e-8 off the double
+  // value and drifts the score across the swap threshold on a knife-edge.
+  double alpha_;
   float min_target_;
-  float decay_factor_;
+  double decay_factor_;
   float stall_timeout_seconds_;
 };
 
 class LoadBalancer {
  public:
-  LoadBalancer(BalancerConfig config, float saturation_alpha,
-               float saturation_min_target, float saturation_decay_factor,
+  LoadBalancer(BalancerConfig config, double saturation_alpha,
+               float saturation_min_target, double saturation_decay_factor,
                float saturation_grace_seconds, float saturation_stall_timeout_seconds,
                bool saturation_enabled, std::function<double()> clock,
                std::function<void()> reset_fn);
@@ -267,6 +297,8 @@ class LoadBalancer {
                             float fair_share);
   float pace_reading_(const std::string &consumer_id, float reading, float reported);
   float damp_oscillation_(const std::string &consumer_id, float residual);
+  float predict_control_grid_(const ReportMap &reports, float grid_total,
+                              const std::vector<float> &sample_id);
 
   std::unordered_map<std::string, float> compute_efficiency_deprioritized_(
       const ReportMap &reports, const std::vector<float> &sample_id, float grid_total);
@@ -298,6 +330,18 @@ class LoadBalancer {
   double post_probe_fade_until_{0.0};
   std::unordered_set<std::string> post_probe_fade_ids_;
   bool all_dc_surplus_warned_{false};
+
+  // Adaptive grid-state predictor state (see predict_control_grid_).
+  // pred_grid_ is the estimate the control path acts on; pred_pool_output_ is
+  // the pool's last-seen reported output (its per-call delta advances the
+  // estimate); pred_sample_id_ flags a genuinely fresh meter reading;
+  // pred_trust_ is the online-adapted meter trust and pred_innov_sign_ the sign
+  // of the last significant innovation that drove it.
+  std::optional<float> pred_grid_{};
+  float pred_pool_output_{0.0f};
+  std::optional<std::vector<float>> pred_sample_id_{};
+  float pred_trust_{0.0f};
+  int pred_innov_sign_{0};
 };
 
 }  // namespace ct002
