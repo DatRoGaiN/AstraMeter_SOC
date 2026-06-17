@@ -240,6 +240,8 @@ void MqttInsightsComponent::publish_consumer_event_(const std::string &consumer_
     }
     root["auto_target"] = snap.auto_target;
     root["distribution_weight"] = snap.distribution_weight;
+    // On-wire value is the 0-1 fraction; HA renders it as a percentage.
+    root["efficiency_window_weight"] = snap.efficiency_window_weight;
     if (snap.min_dc_output.has_value()) {
       root["min_dc_output"] = *snap.min_dc_output;
     } else {
@@ -275,7 +277,8 @@ void MqttInsightsComponent::publish_consumer_event_(const std::string &consumer_
       this->discovered_consumers_.insert(consumer_id);
       auto [topic, payload] = build_ct002_consumer_discovery(
           this->base_topic_, this->device_id_, consumer_id, this->ha_discovery_prefix_,
-          snap.device_type);
+          snap.device_type,
+          this->ct002_ != nullptr && this->ct002_->efficiency_rotation_enabled());
       this->mqtt_->publish(topic, payload, 0, true);
     }
   }
@@ -386,6 +389,18 @@ void MqttInsightsComponent::handle_consumer_field_command_(const std::string &co
       this->ct002_->set_consumer_distribution_weight(consumer_id, w);
     } else {
       ESP_LOGW(TAG, "Out-of-range distribution_weight for %s: %.2f", consumer_id.c_str(), w);
+    }
+  } else if (field == "efficiency_window_weight") {
+    // HA sends a percentage (0-100 %); convert to the internal 0-1 fraction.
+    float pct;
+    if (!parse_float_payload(payload, pct)) {
+      ESP_LOGW(TAG, "Invalid efficiency_window_weight for %s: %s", consumer_id.c_str(),
+               payload.c_str());
+    } else if (std::isfinite(pct) && pct >= 0.0f && pct <= 100.0f) {
+      this->ct002_->set_consumer_efficiency_window_weight(consumer_id, pct / 100.0f);
+    } else {
+      ESP_LOGW(TAG, "Out-of-range efficiency_window_weight for %s: %.2f",
+               consumer_id.c_str(), pct);
     }
   } else if (field == "min_dc_output") {
     float v;
