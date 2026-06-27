@@ -7,6 +7,8 @@ import signal
 from collections import OrderedDict
 from collections.abc import Sequence
 
+import aiohttp
+
 from astrameter.cloud_reporting import (
     CloudReporter,
     CloudReporterConfig,
@@ -19,6 +21,7 @@ from astrameter.config.config_loader import (
 )
 from astrameter.config.logger import logger, setLogLevel
 from astrameter.ct002 import CT002, UDP_PORT
+from astrameter.ct002.soc_distributor import SOCDistributor
 from astrameter.marstek_api import (
     MarstekApiError,
     MarstekConfig,
@@ -135,6 +138,108 @@ def _reset_all_powermeters(
         pm.reset()
 
 
+async def _create_ha_soc_updater(
+    cfg: configparser.ConfigParser,
+    soc_distributor: SOCDistributor,
+) -> asyncio.Task | None:
+    """Create an async task that periodically updates SOC values from Home Assistant.
+    
+    Returns None if HA is not configured or SOC distribution is disabled.
+    Otherwise returns the background task for cleanup.
+    """
+    if not cfg.has_section("HOMEASSISTANT"):
+        return None
+    
+    # Get HA connection details
+    ha_ip = cfg.get("HOMEASSISTANT", "IP", fallback="")
+    ha_port = cfg.getint("HOMEASSISTANT", "PORT", fallback=8123)
+    ha_https = cfg.getboolean("HOMEASSISTANT", "HTTPS", fallback=False)
+    ha_token = cfg.get("HOMEASSISTANT", "ACCESSTOKEN", fallback="")
+    
+    if not ha_ip or not ha_token:
+        logger.warning("SOC distribution enabled but HOMEASSISTANT IP or ACCESSTOKEN missing")
+        return None
+    
+    # Get SOC sensor entities from config
+    # Format: BATTERY_1_SOC_ENTITY = sensor.battery1_soc
+    battery_1_soc = cfg.get("CT002", "BATTERY_1_SOC_ENTITY", fallback="").strip()
+    battery_2_soc = cfg.get("CT002", "BATTERY_2_SOC_ENTITY", fallback="").strip()
+    battery_1_mac = cfg.get("CT002", "BATTERY_1_MAC", fallback="").strip()
+    battery_2_mac = cfg.get("CT002", "BATTERY_2_MAC", fallback="").strip()
+    
+    if not battery_1_soc or not battery_2_soc or not battery_1_mac or not battery_2_mac:
+        logger.warning(
+            "SOC distribution enabled but SOC entity IDs or battery MACs missing: "
+            "BATTERY_1_SOC_ENTITY=%s, BATTERY_2_SOC_ENTITY=%s",
+            battery_1_soc,
+            battery_2_soc,
+        )
+        return None
+    
+    # Poll interval (default 5 seconds, same as power meter)
+    soc_poll_interval = cfg.getfloat("CT002", "SOC_POLL_INTERVAL", fallback=5.0)
+    
+    scheme = "https" if ha_https else "http"
+    ha_url_base = f"{scheme}://{ha_ip}:{ha_port}"
+    
+    logger.info(
+        "SOC updater configured: polling %s and %s from %s every %.1f seconds",
+        battery_1_soc,
+        battery_2_soc,
+        ha_url_base,
+        soc_poll_interval,
+    )
+    
+    async def _soc_update_loop():
+        """Periodically fetch SOC values from Home Assistant and update distributor."""
+        headers = {
+            "Authorization": f"Bearer {ha_token}",
+            "Content-Type": "application/json",
+        }
+        
+        # Disable SSL verification if needed
+        connector = aiohttp.TCPConnector(ssl=False) if ha_https else None
+        
+        try:
+            async with aiohttp.ClientSession(connector=connector) as session:
+                while True:
+                    try:
+                        # Fetch battery 1 SOC
+                        soc1_entity_id = battery_1_soc.replace(".", "/")
+                        url1 = f"{ha_url_base}/api/states/sensor.{soc1_entity_id}"
+                        async with session.get(url1, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                            if resp.status == 200:
+                                data1 = await resp.json()
+                                soc1_value = float(data1.get("state", 0))
+                                soc_distributor.update_soc(battery_1_mac, soc1_value)
+                            else:
+                                logger.debug(f"Failed to fetch {battery_1_soc}: HTTP {resp.status}")
+                        
+                        # Fetch battery 2 SOC
+                        soc2_entity_id = battery_2_soc.replace(".", "/")
+                        url2 = f"{ha_url_base}/api/states/sensor.{soc2_entity_id}"
+                        async with session.get(url2, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                            if resp.status == 200:
+                                data2 = await resp.json()
+                                soc2_value = float(data2.get("state", 0))
+                                soc_distributor.update_soc(battery_2_mac, soc2_value)
+                            else:
+                                logger.debug(f"Failed to fetch {battery_2_soc}: HTTP {resp.status}")
+                        
+                    except asyncio.TimeoutError:
+                        logger.debug("SOC update timeout - retrying next cycle")
+                    except Exception as exc:
+                        logger.debug(f"SOC update error: {exc}")
+                    
+                    await asyncio.sleep(soc_poll_interval)
+        
+        except Exception as exc:
+            logger.error(f"SOC updater crashed: {exc}", exc_info=True)
+    
+    task = asyncio.create_task(_soc_update_loop())
+    return task
+
+
 async def run_device(
     device_type: str,
     cfg: configparser.ConfigParser,
@@ -144,6 +249,8 @@ async def run_device(
     insights: MqttInsightsService | None = None,
     marstek_mac: str = "",
     marstek_ver_v: int | None = None,
+    soc_distributor: SOCDistributor | None = None,
+    soc_updater_task: asyncio.Task | None = None,
 ):
     logger.debug(f"Starting device: {device_type}")
 
@@ -272,6 +379,8 @@ async def run_device(
                 extras.append("saturation detection")
             if min_efficient_power > 0:
                 extras.append(f"efficiency optimization ({min_efficient_power}W)")
+            if soc_distributor:
+                extras.append("SOC-based distribution")
             logger.info(
                 "Active control enabled: load split%s",
                 " + " + " + ".join(extras) if extras else "",
@@ -318,6 +427,7 @@ async def run_device(
             saturation_decay_factor=saturation_decay_factor,
             device_id=device_id or "",
             reset_fn=lambda: _reset_all_powermeters(powermeters),
+            soc_distributor=soc_distributor,
         )
 
         async def update_readings(addr, _fields=None, _consumer_id=None):
@@ -575,6 +685,12 @@ async def run_device(
             await device.stop()
         except Exception:
             logger.exception("Device %s (%s) failed to stop", device_type, device_id)
+        
+        # Cleanup SOC updater task if running
+        if soc_updater_task is not None:
+            soc_updater_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await soc_updater_task
 
 
 async def async_main(
@@ -612,6 +728,8 @@ async def async_main(
 
     powermeters: list[tuple[Powermeter, ClientFilter, bool]] = []
     insights: MqttInsightsService | None = None
+    soc_distributor: SOCDistributor | None = None
+    soc_updater_task: asyncio.Task | None = None
 
     try:
         # Create powermeters
@@ -624,6 +742,26 @@ async def async_main(
         if not skip_test:
             for powermeter, client_filter, _ in powermeters:
                 await test_powermeter(powermeter, client_filter)
+
+        # Initialize SOC distributor if enabled
+        soc_enabled = cfg.getboolean("CT002", "SOC_DISTRIBUTION_ENABLED", fallback=False)
+        if soc_enabled:
+            battery_1_mac = cfg.get("CT002", "BATTERY_1_MAC", fallback="").strip().lower()
+            battery_2_mac = cfg.get("CT002", "BATTERY_2_MAC", fallback="").strip().lower()
+            
+            if battery_1_mac and battery_2_mac:
+                soc_distributor = SOCDistributor(
+                    battery_1_mac=battery_1_mac,
+                    battery_2_mac=battery_2_mac,
+                )
+                # Create background task to update SOC values
+                soc_updater_task = await _create_ha_soc_updater(cfg, soc_distributor)
+                if soc_updater_task:
+                    logger.info("SOC updater task started")
+                else:
+                    logger.warning("SOC distribution enabled but updater task could not start")
+            else:
+                logger.warning("SOC_DISTRIBUTION_ENABLED is true but battery MACs are missing")
 
         # MQTT Insights (optional)
         insights_cfg = read_mqtt_insights_config(cfg)
@@ -648,6 +786,8 @@ async def async_main(
                     device_id,
                     insights,
                     *managed_marstek.get(device_type, ("", None)),
+                    soc_distributor=soc_distributor,
+                    soc_updater_task=soc_updater_task,
                 )
                 for device_type, device_id in zip(
                     device_types, device_ids, strict=False
@@ -657,6 +797,14 @@ async def async_main(
     finally:
         # Best-effort shutdown: each resource gets a stop attempt even if
         # an earlier one fails.
+        
+        # Cleanup SOC updater
+        if soc_updater_task is not None:
+            soc_updater_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await soc_updater_task
+                logger.info("SOC updater task stopped")
+        
         if insights:
             try:
                 await insights.stop()

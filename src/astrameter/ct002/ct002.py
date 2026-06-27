@@ -11,6 +11,7 @@ from typing import Any, Literal, cast
 
 from astrameter.config.logger import debug_traceback, logger
 from astrameter.request_dedupe import RequestDeduplicator
+from astrameter.ct002.soc_distributor import SOCDistributor  # ← NEU HINZUGEFÜGT
 
 from .balancer import (
     SATURATION_GRACE_SECONDS,
@@ -208,6 +209,7 @@ class CT002:
         device_id="",
         clock=None,
         reset_fn=None,
+        soc_distributor=None,  # ← NEU HINZUGEFÜGT
     ) -> None:
         self.udp_port = udp_port
         self.ct_mac = ct_mac
@@ -280,8 +282,12 @@ class CT002:
             saturation_enabled=saturation_detection,
             clock=clock,
             reset_fn=reset_fn,
+            soc_distributor=soc_distributor,  # ← NEU HINZUGEFÜGT
         )
 
+    # [REST DER KLASSE - alle anderen Methoden bleiben UNVERÄNDERT]
+    # ... (alle Methoden von _consumer_key bis stop sind identisch)
+    
     def _consumer_key(self, addr, fields):
         battery_mac = fields[1] if len(fields) > 1 else ""
         if battery_mac:
