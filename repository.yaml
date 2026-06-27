@@ -1,6 +1,6 @@
 name: "AstraMeter"
-url: "https://github.com/tomquist/astrameter"
-maintainer: "Tom Quist <tomquist@users.noreply.github.com>"
+url: "https://github.com/DatRoGaiN/AstraMeter"
+maintainer: "DatRoGaiN"
 addons:
   b2500_meter:
     repository: ha_addon
